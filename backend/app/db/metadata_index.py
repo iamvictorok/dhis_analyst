@@ -163,3 +163,81 @@ async def search_org_unit_by_name(
             "level": level,
         })
     return results
+
+
+async def search_indicator_by_name(
+    session,
+    name: str,
+    *,
+    is_postgres: bool = False,
+    limit: int = 3,
+) -> list[dict[str, Any]]:
+    """Search indicators/dataElements by name in the synced metadata index.
+
+    Tries exact match first, then LIKE. Works with both Postgres and SQLite.
+    """
+    import re
+    from sqlalchemy import text
+
+    table = "metadata_index" if is_postgres else "metadata_index_lite"
+
+    # Clean common qualifiers that might mismatch
+    def clean_label(n: str) -> str:
+        cleaned = re.sub(
+            r"\b(coverage|rate|total|cases|confirmed|suspected)\b",
+            "",
+            n,
+            flags=re.IGNORECASE,
+        )
+        return cleaned.strip()
+
+    search_terms = [name]
+    cleaned = clean_label(name)
+    if cleaned and cleaned.lower() != name.lower():
+        search_terms.append(cleaned)
+
+    rows = []
+    for term in search_terms:
+        # 1. Exact case-insensitive match
+        result = await session.execute(
+            text(f"""
+                SELECT uid, name, object_type, short_name, description
+                FROM {table}
+                WHERE object_type IN ('indicator', 'dataElement', 'programIndicator')
+                  AND LOWER(name) = LOWER(:name)
+                LIMIT :lim
+            """),
+            {"name": term, "lim": limit},
+        )
+        rows = result.fetchall()
+        if rows:
+            break
+
+        # 2. LIKE pattern match
+        pattern = f"%{term}%"
+        result = await session.execute(
+            text(f"""
+                SELECT uid, name, object_type, short_name, description
+                FROM {table}
+                WHERE object_type IN ('indicator', 'dataElement', 'programIndicator')
+                  AND (LOWER(name) LIKE LOWER(:pattern)
+                       OR LOWER(short_name) LIKE LOWER(:pattern))
+                LIMIT :lim
+            """),
+            {"pattern": pattern, "lim": limit},
+        )
+        rows = result.fetchall()
+        if rows:
+            break
+
+    return [
+        {
+            "uid": row[0],
+            "label": row[1],
+            "object_type": row[2],
+            "short_name": row[3],
+            "description": row[4],
+            "uid_confidence": 0.85,
+        }
+        for row in rows
+    ]

@@ -65,9 +65,18 @@ async def resolve_metadata(state: AgentState, settings: Settings) -> AgentState:
         except Exception as exc:
             logger.warning("pgvector_resolve_failed", extra={"error": str(exc)})
 
+    # SQLite path: resolve ALL metrics whose UIDs look fabricated or have low confidence
+    if not settings.is_postgres:
+        try:
+            metrics = await _sqlite_resolve_indicators(metrics, settings)
+            state["metrics"] = metrics
+            low_confidence = [m for m in metrics if m["uid_confidence"] < settings.metadata_confidence_threshold]
+        except Exception as exc:
+            logger.warning("sqlite_indicator_resolve_failed", extra={"error": str(exc)})
+
     # If Postgres isn't used, we skip pgvector but might still check fallback or keywords
     if low_confidence:
-        # Still low after pgvector — surface disambiguation
+        # Still low after resolution — surface disambiguation
         query_labels = " ".join(m["label"] for m in low_confidence)
         candidates = _keyword_candidates(query_labels)
         if candidates:
@@ -160,6 +169,66 @@ async def _resolve_org_unit_from_db(label: str, settings: Settings) -> dict | No
         "uid": best["uid"],
         "level": best.get("level", 2),
     }
+
+
+async def _sqlite_resolve_indicators(
+    metrics: list[dict],
+    settings: Settings,
+) -> list[dict]:
+    """Resolve indicator UIDs via SQLite keyword search.
+
+    Replaces LLM-guessed UIDs with real ones from the synced metadata DB.
+    Only resolves metrics whose UIDs look fabricated (not valid DHIS2 UIDs).
+    """
+    from backend.app.db.metadata_index import search_indicator_by_name
+    from backend.app.db.session import get_db_session
+
+    resolved = []
+    async with get_db_session() as session:
+        for metric in metrics:
+            # Skip if the UID already looks like a real DHIS2 UID AND confidence is high
+            if (
+                _looks_like_dhis2_uid(metric.get("uid", ""))
+                and metric.get("uid_confidence", 0) >= settings.metadata_confidence_threshold
+            ):
+                resolved.append(metric)
+                continue
+
+            results = await search_indicator_by_name(
+                session,
+                metric["label"],
+                is_postgres=settings.is_postgres,
+                limit=3,
+            )
+
+            if results:
+                best = results[0]
+                logger.info(
+                    "indicator_resolved_sqlite",
+                    extra={
+                        "original_label": metric["label"],
+                        "original_uid": metric.get("uid"),
+                        "resolved_uid": best["uid"],
+                        "resolved_label": best["label"],
+                        "object_type": best.get("object_type"),
+                    },
+                )
+                resolved.append({
+                    "label": best["label"],
+                    "uid": best["uid"],
+                    "uid_confidence": best.get("uid_confidence", 0.85),
+                    "object_type": best.get("object_type", "indicator"),
+                })
+            else:
+                logger.warning(
+                    "indicator_not_found_sqlite",
+                    extra={"label": metric["label"], "uid": metric.get("uid")},
+                )
+                # Keep original but mark low confidence to trigger disambiguation
+                metric["uid_confidence"] = 0.50
+                resolved.append(metric)
+
+    return resolved
 
 
 async def _pgvector_resolve(

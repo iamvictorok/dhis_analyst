@@ -110,14 +110,30 @@ class DHIS2Client:
                     )
                     continue
             except httpx.HTTPStatusError as exc:
-                logger.error(
-                    f"dhis2_http_error: HTTP {exc.response.status_code} - {exc.response.text[:500]}",
-                    extra={
-                        "path": path,
-                        "status": exc.response.status_code,
-                        "duration_ms": int((time.monotonic() - start) * 1000),
-                    },
-                )
+                body = exc.response.text[:500]
+                is_html = "<html" in body.lower() or "<!doctype" in body.lower()
+                if is_html and exc.response.status_code == 404:
+                    logger.error(
+                        "dhis2_base_url_wrong: Got HTML 404 from nginx — "
+                        "DHIS2_BASE_URL likely points at a frontend wrapper, not the API host. "
+                        f"Current base: {self._base_url}",
+                        extra={
+                            "path": path,
+                            "full_url": f"{self._base_url}{path}",
+                            "status": 404,
+                            "hint": "Check DHIS2_BASE_URL in .env — try the play.im.dhis2.org host",
+                        },
+                    )
+                else:
+                    logger.error(
+                        f"dhis2_http_error: HTTP {exc.response.status_code} - {body}",
+                        extra={
+                            "path": path,
+                            "full_url": f"{self._base_url}{path}",
+                            "status": exc.response.status_code,
+                            "duration_ms": int((time.monotonic() - start) * 1000),
+                        },
+                    )
                 raise
             except Exception as exc:
                 logger.error(

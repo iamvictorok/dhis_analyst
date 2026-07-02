@@ -208,17 +208,18 @@ async def classify_intent_llm(
     from backend.app.llm import complete
 
     now = today or date.today()
-    metric_list = "\n".join(f"- {label} (uid: {uid})" for label, uid in list(set(KNOWN_METRICS.values()))[:30])
+
+    # Build compressed context from history instead of dumping raw messages
+    history_context = _build_history_context(history) if history else ""
 
     relative_period_list = ", ".join(sorted(DHIS2_RELATIVE_PERIODS))
     system = f"""You are an intent classifier for a DHIS2 public health analytics system.
 Today is {now.isoformat()}. Analyse the user query and return ONLY a JSON object.
 
-CRITICAL: You are provided with the conversation history (if any) before the user query.
-Use the conversation history to understand follow-up questions, omissions, and context changes.
-For example, if the user previously asked for 'malaria confirmed cases in Lagos in 2024' and now asks 'What about 2025?', you must carry over the metric ('Malaria Confirmed Cases' with its UID) and the organization unit ('Lagos' with its level/UID), but update the periods to ['2025'].
-Similarly, if they ask 'What about Oyo state?', carry over the metric and periods but update the organization unit to 'Oyo State'.
-If a query is general, conversational, or a direct follow-up explaining or discussing the data (e.g. 'explain this trend', 'why did this decrease?'), select 'conversational' as the output_mode and carry over the relevant metrics, periods, and organization unit context from the history.
+{f"CONVERSATION CONTEXT (use this to understand follow-ups):{chr(10)}{history_context}{chr(10)}" if history_context else ""}
+CRITICAL RULES FOR FOLLOW-UP QUERIES:
+- If the user refers to something from the conversation context (e.g. "What about 2025?", "Show me Lagos instead"), carry over the unmentioned fields from the context and only update what changed.
+- If the query is general, conversational, or discusses prior data (e.g. "explain this trend", "why?"), use output_mode "conversational" and carry over the relevant context.
 
 Available output modes:
 - conversational: general Q&A, analysis, explanations, follow-up comments on data
@@ -227,14 +228,16 @@ Available output modes:
 - presentation: slide decks, briefing decks
 - export: raw data extraction, Excel/CSV downloads
 
-Available metrics (sample):
-{metric_list}
+IMPORTANT — Metric handling:
+- Output metric LABELS only. Do NOT invent or guess UIDs. Set uid to null.
+- The metadata pipeline will resolve real UIDs from the synced DHIS2 database.
+- Use descriptive health indicator names (e.g. "Malaria confirmed cases", "ANC 1st visit", "OPV3 coverage").
 
 Return JSON with these exact keys:
 {{
   "output_mode": "<one of the 5 modes>",
   "requires_data": <true/false>,
-  "metrics": [{{"label": "<name>", "uid": "<uid>", "object_type": "indicator"}}],
+  "metrics": [{{"label": "<indicator name>", "uid": null, "object_type": "indicator"}}],
   "org_unit_label": "<detected location or 'National'>",
   "periods": ["<DHIS2 period code>"],
   "needs_web_enrichment": <true/false>,
@@ -263,12 +266,6 @@ Web enrichment: true for WHO guidelines, benchmarks, outbreak context, policy, e
 """
 
     llm_messages = [{"role": "system", "content": system}]
-    if history:
-        for msg in history:
-            llm_messages.append({
-                "role": msg["role"],
-                "content": msg["content"]
-            })
     llm_messages.append({"role": "user", "content": message})
 
     raw = await complete(
@@ -279,6 +276,44 @@ Web enrichment: true for WHO guidelines, benchmarks, outbreak context, policy, e
     )
     parsed = json.loads(raw)
     return _merge_llm_intent(parsed, forced_mode, now)
+
+
+def _build_history_context(history: list[dict[str, str]]) -> str:
+    """Build a compressed context summary from conversation history.
+
+    Instead of dumping raw messages (which lite models struggle with),
+    extract the key structured fields and present them concisely.
+    """
+    if not history:
+        return ""
+
+    parts = []
+    last_user_msg = None
+    last_assistant_msg = None
+
+    for msg in history:
+        if msg["role"] == "user":
+            last_user_msg = msg["content"]
+        elif msg["role"] == "assistant":
+            last_assistant_msg = msg["content"]
+
+    if last_user_msg:
+        # Truncate to keep prompt lean
+        truncated = last_user_msg[:200]
+        parts.append(f"- User previously asked: \"{truncated}\"")
+
+    if last_assistant_msg:
+        # Take first 300 chars of assistant response for topic context
+        truncated = last_assistant_msg[:300]
+        parts.append(f"- Assistant responded with: \"{truncated}...\"")
+
+    # Also include any earlier user messages for richer context (up to 2 more)
+    earlier_user_msgs = [m["content"] for m in history if m["role"] == "user"]
+    if len(earlier_user_msgs) > 1:
+        for msg in earlier_user_msgs[:-1][-2:]:
+            parts.append(f"- Earlier question: \"{msg[:150]}\"")
+
+    return "\n".join(parts)
 
 
 # ---------------------------------------------------------------------------
@@ -420,13 +455,18 @@ def _merge_llm_intent(parsed: dict, forced_mode: OutputMode | None, today: date)
     if not metrics:
         metrics = [{
             "label": "Health Service Coverage Rate",
-            "uid": "Jtf34kNZhzP",
-            "uid_confidence": 0.60,
+            "uid": "UNRESOLVED",
+            "uid_confidence": 0.40,
             "object_type": "indicator",
         }]
     else:
         for m in metrics:
-            m.setdefault("uid_confidence", 0.90)
+            # LLM now outputs uid=null — mark as needing resolution
+            if not m.get("uid") or m["uid"] == "null":
+                m["uid"] = "UNRESOLVED"
+                m["uid_confidence"] = 0.40
+            else:
+                m.setdefault("uid_confidence", 0.90)
             m.setdefault("object_type", "indicator")
 
     org_label = parsed.get("org_unit_label", "National")
