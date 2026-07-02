@@ -37,13 +37,23 @@ export default function DownloadBar({ reportHtml, slides, exportData }) {
 
       const data = await res.json();
       if (data.file_id) {
-        // Trigger download
+        // Fetch the file with auth headers to avoid 401
+        const downloadHeaders = {};
+        if (auth?.token) downloadHeaders['Authorization'] = `Bearer ${auth.token}`;
+
+        const downloadRes = await fetch(`/api/download/${data.file_id}`, { headers: downloadHeaders });
+        if (!downloadRes.ok) throw new Error(`Download failed: ${downloadRes.status} ${downloadRes.statusText}`);
+
+        const blob = await downloadRes.blob();
+        const url = window.URL.createObjectURL(blob);
+
         const link = document.createElement('a');
-        link.href = `/api/download/${data.file_id}`;
-        link.download = data.filename || data.file_id;
+        link.href = url;
+        link.download = data.filename || `${data.file_id}.${fmt.label.toLowerCase()}`;
         document.body.appendChild(link);
         link.click();
         link.remove();
+        window.URL.revokeObjectURL(url);
       }
     } catch (err) {
       console.error('Download failed:', err);

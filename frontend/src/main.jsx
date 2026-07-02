@@ -518,17 +518,13 @@ function MessageBlock({ msg, isLast, isLoading }) {
       {/* Inline artefacts — only for assistant messages */}
       {!isUser && (hasCharts || hasReport || hasEvidence || hasSlides || hasExport) && (
         <div class="message-artefacts">
-          {/* Inline Download Bar */}
-          <div style="display: flex; align-items: center; justify-content: space-between; margin-bottom: 16px; padding-bottom: 8px; border-bottom: 1px solid var(--border-color); flex-wrap: wrap; gap: 8px;">
-            <span style="font-size: 0.8rem; color: var(--text-muted); font-weight: 600; text-transform: uppercase; letter-spacing: 0.05em;">Download Artifact:</span>
-            <DownloadBar reportHtml={art.reportHtml} slides={art.slides} exportData={art.exportData} />
-          </div>
-
           {hasCharts && (
             <div class="artefact-section">
-              <div class="artefact-section-head">
-                <h3>📊 Dashboard</h3>
-                <span class="badge">{art.charts.length} chart{art.charts.length !== 1 ? 's' : ''}</span>
+              <div class="artefact-section-head" style="display: flex; align-items: center; justify-content: space-between; width: 100%;">
+                <div style="display: flex; align-items: center; gap: 8px;">
+                  <h3>📊 Dashboard</h3>
+                  <span class="badge">{art.charts.length} chart{art.charts.length !== 1 ? 's' : ''}</span>
+                </div>
               </div>
               <Dashboard charts={art.charts} />
             </div>
@@ -536,19 +532,49 @@ function MessageBlock({ msg, isLast, isLoading }) {
 
           {hasReport && (
             <div class="artefact-section">
-              <div class="artefact-section-head">
-                <h3>📄 Report</h3>
-                <span class="badge">Editable</span>
+              <div class="artefact-section-head" style="display: flex; align-items: center; justify-content: space-between; width: 100%;">
+                <div style="display: flex; align-items: center; gap: 8px;">
+                  <h3>📄 Report</h3>
+                  <span class="badge">Editable</span>
+                </div>
+                <DownloadBar reportHtml={art.reportHtml} allowedFormats={['DOCX', 'PDF']} />
               </div>
               <ReportEditor html={art.reportHtml} onChange={() => {}} />
             </div>
           )}
 
+          {hasSlides && (
+            <div class="artefact-section">
+              <div class="artefact-section-head" style="display: flex; align-items: center; justify-content: space-between; width: 100%;">
+                <div style="display: flex; align-items: center; gap: 8px;">
+                  <h3>🎴 Presentation Slides</h3>
+                  <span class="badge">{art.slides.length} slides</span>
+                </div>
+                <DownloadBar slides={art.slides} allowedFormats={['PPTX']} />
+              </div>
+              <div class="slides-preview-wrapper" style="overflow-x: auto; display: flex; gap: 12px; padding: 8px 0; margin-top: 8px;">
+                {art.slides.map((slide, sIdx) => (
+                  <div key={sIdx} style="flex: 0 0 220px; border: 1px solid var(--border-color); border-radius: 6px; padding: 12px; background: var(--bg-glass); backdrop-filter: blur(10px); box-shadow: var(--shadow-sm);">
+                    <h4 style="margin: 0 0 8px 0; font-size: 0.8rem; font-weight: 600; color: var(--accent); border-bottom: 1px solid var(--border-color); padding-bottom: 4px;">{slide.title || `Slide ${sIdx + 1}`}</h4>
+                    <ul style="margin: 0; padding-left: 14px; font-size: 0.72rem; color: var(--text-secondary); line-height: 1.4;">
+                      {(slide.bullets || []).slice(0, 4).map((bullet, bIdx) => (
+                        <li key={bIdx}>{bullet}</li>
+                      ))}
+                    </ul>
+                  </div>
+                ))}
+              </div>
+            </div>
+          )}
+
           {hasExport && (
             <div class="artefact-section">
-              <div class="artefact-section-head">
-                <h3>📋 Export Data</h3>
-                <span class="badge">{(art.exportData.rows || []).length} rows</span>
+              <div class="artefact-section-head" style="display: flex; align-items: center; justify-content: space-between; width: 100%;">
+                <div style="display: flex; align-items: center; gap: 8px;">
+                  <h3>📋 Export Data</h3>
+                  <span class="badge">{(art.exportData.rows || []).length} rows</span>
+                </div>
+                <DownloadBar exportData={art.exportData} allowedFormats={['XLSX', 'CSV']} />
               </div>
               <div class="export-preview-table-wrapper" style="overflow-x: auto; max-height: 250px; border: 1px solid var(--border-color); border-radius: 6px; background: var(--bg-primary); margin-top: 8px;">
                 <table class="export-preview-table" style="width: 100%; border-collapse: collapse; font-size: 0.85rem;">
