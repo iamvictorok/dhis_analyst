@@ -80,6 +80,13 @@ class DHIS2Client:
         """Fetch current user profile — used for token validation."""
         return await self._get("/api/me.json")
 
+    async def health_check(self) -> dict[str, Any]:
+        """Validate DHIS2 connectivity via /api/system/info.json.
+
+        Returns system info dict on success. Raises on any failure.
+        """
+        return await self._get("/api/system/info.json")
+
     async def _get(self, path: str, params: dict[str, Any] | None = None) -> dict[str, Any]:
         """GET with 1 retry on connection error."""
         kwargs = self._build_client_kwargs()

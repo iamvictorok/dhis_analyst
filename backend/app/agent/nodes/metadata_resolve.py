@@ -18,21 +18,6 @@ from backend.app.agent.state import AgentState
 
 logger = logging.getLogger("dhis2_analyst.metadata_resolve")
 
-# Fallback in-memory index (always available even without DB)
-_FALLBACK_INDEX = [
-    {"label": "Malaria Confirmed Cases",     "uid": "fbfJHSPpUQD", "uid_confidence": 0.95, "object_type": "indicator"},
-    {"label": "ANC 1st Visit Coverage",      "uid": "Uvn6LCg7dVU", "uid_confidence": 0.93, "object_type": "indicator"},
-    {"label": "OPV3 Dropout Rate",           "uid": "rXoaHGAXWy9", "uid_confidence": 0.90, "object_type": "indicator"},
-    {"label": "Cholera Suspected Cases",     "uid": "vc6J1qOWsNR", "uid_confidence": 0.88, "object_type": "indicator"},
-    {"label": "TB Cases Notified",           "uid": "XocrRn044Xo", "uid_confidence": 0.88, "object_type": "indicator"},
-    {"label": "Penta3 Coverage",             "uid": "S8uo8AlvYDf", "uid_confidence": 0.87, "object_type": "indicator"},
-    {"label": "Facility Delivery Rate",      "uid": "A03MvHHogjR", "uid_confidence": 0.87, "object_type": "indicator"},
-    {"label": "Stunting Rate Under 5",       "uid": "noIzB569hTM", "uid_confidence": 0.86, "object_type": "indicator"},
-    {"label": "HIV+ Pregnant Women on ART",  "uid": "ybzlGLjWwnK", "uid_confidence": 0.86, "object_type": "indicator"},
-    {"label": "Maternal Deaths",             "uid": "O05mAByOgAv", "uid_confidence": 0.85, "object_type": "indicator"},
-    {"label": "Health Service Coverage Rate","uid": "Jtf34kNZhzP", "uid_confidence": 0.75, "object_type": "indicator"},
-]
-
 
 async def resolve_metadata(state: AgentState, settings: Settings) -> AgentState:
     """Resolve metric UIDs and org unit UIDs with confidence gate."""
@@ -41,8 +26,9 @@ async def resolve_metadata(state: AgentState, settings: Settings) -> AgentState:
     metrics = state["metrics"]
 
     if not metrics:
-        state["metrics"] = [_FALLBACK_INDEX[0]]
-        metrics = state["metrics"]
+        state["clarification_needed"] = True
+        state["clarification_question"] = "I couldn't identify a health indicator in your question. Could you specify which indicator you'd like to analyse?"
+        return state
 
     logger.info(
         "resolve_metadata_start",
@@ -76,9 +62,9 @@ async def resolve_metadata(state: AgentState, settings: Settings) -> AgentState:
 
     # If Postgres isn't used, we skip pgvector but might still check fallback or keywords
     if low_confidence:
-        # Still low after resolution — surface disambiguation
+        # Still low after resolution — surface disambiguation from synced DB
         query_labels = " ".join(m["label"] for m in low_confidence)
-        candidates = _keyword_candidates(query_labels)
+        candidates = await _keyword_candidates_from_db(query_labels, settings)
         if candidates:
             names = ", ".join(f'"{c["label"]}"' for c in candidates[:3])
             state["clarification_needed"] = True
@@ -287,14 +273,20 @@ async def _pgvector_resolve(
     return resolved
 
 
-def _keyword_candidates(query: str) -> list[dict]:
-    """Return up to 3 fallback candidates by keyword overlap."""
-    q = query.lower()
-    scored = []
-    for item in _FALLBACK_INDEX:
-        label_lower = item["label"].lower()
-        overlap = sum(1 for word in q.split() if word in label_lower)
-        if overlap > 0:
-            scored.append((overlap, item))
-    scored.sort(key=lambda x: -x[0])
-    return [item for _, item in scored[:3]]
+async def _keyword_candidates_from_db(query: str, settings: Settings) -> list[dict]:
+    """Return up to 3 disambiguation candidates from the synced metadata DB."""
+    from backend.app.db.metadata_index import search_indicator_by_name
+    from backend.app.db.session import get_db_session
+
+    try:
+        async with get_db_session() as session:
+            results = await search_indicator_by_name(
+                session,
+                query,
+                is_postgres=settings.is_postgres,
+                limit=3,
+            )
+        return results
+    except Exception as exc:
+        logger.warning("keyword_candidates_db_failed", extra={"error": str(exc)})
+        return []

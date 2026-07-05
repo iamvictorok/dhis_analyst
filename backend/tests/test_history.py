@@ -17,7 +17,7 @@ async def test_classify_intent_llm_passes_history():
     )
     mock_response = """{
         "output_mode": "conversational",
-        "metrics": [{"label": "Malaria Confirmed Cases", "uid": "fbfJHSPpUQD"}],
+        "metrics": [{"label": "Malaria Confirmed Cases", "uid": null, "object_type": "indicator"}],
         "org_unit_label": "Lagos",
         "periods": ["2025"],
         "needs_web_enrichment": false,
@@ -77,7 +77,7 @@ async def test_build_initial_state_contains_history():
     
     mock_response = """{
         "output_mode": "conversational",
-        "metrics": [{"label": "Malaria Confirmed Cases", "uid": "fbfJHSPpUQD"}],
+        "metrics": [{"label": "Malaria Confirmed Cases", "uid": null, "object_type": "indicator"}],
         "org_unit_label": "Oyo",
         "periods": ["2025"],
         "needs_web_enrichment": false,

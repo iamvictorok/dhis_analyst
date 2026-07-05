@@ -1,8 +1,9 @@
 """Intent classifier — the most critical prompt in the system.
 
 Routes through LiteLLM for full NL intent extraction.
-The deterministic keyword-based classify_intent() function is retained
-for unit testing but is NOT used in the production pipeline.
+The deterministic classify_intent() is a generic fallback for when the LLM
+returns malformed JSON — it extracts metric labels and org unit names from
+natural language without any hardcoded instance-specific data.
 """
 from __future__ import annotations
 
@@ -16,65 +17,18 @@ logger = logging.getLogger("dhis2_analyst.intent")
 
 OutputMode = Literal["conversational", "dashboard", "report", "presentation", "export"]
 
-# ---------------------------------------------------------------------------
-# Known DHIS2 health indicators — expanded for production coverage
-# ---------------------------------------------------------------------------
-
-KNOWN_METRICS: dict[str, tuple[str, str]] = {
-    # Malaria
-    "malaria": ("Malaria Confirmed Cases", "fbfJHSPpUQD"),
-    "malaria confirmed": ("Malaria Confirmed Cases", "fbfJHSPpUQD"),
-    "malaria suspected": ("Malaria Suspected Cases", "cYeuwXTCPkU"),
-    "malaria death": ("Malaria Deaths", "hfdmMSPBgLG"),
-    # ANC
-    "anc": ("ANC 1st Visit Coverage", "Uvn6LCg7dVU"),
-    "anc1": ("ANC 1st Visit Coverage", "Uvn6LCg7dVU"),
-    "anc4": ("ANC 4th Visit Coverage", "OdiHJayrsKo"),
-    "antenatal": ("ANC 1st Visit Coverage", "Uvn6LCg7dVU"),
-    # Immunisation / EPI
-    "opv3": ("OPV3 Dropout Rate", "rXoaHGAXWy9"),
-    "opv": ("OPV3 Coverage", "x3Do5e7g4Qo"),
-    "penta3": ("Penta3 Coverage", "S8uo8AlvYDf"),
-    "dtp": ("DTP3 Coverage", "Y53Vs9fTF4A"),
-    "measles": ("Measles Coverage", "I78gJm4KBo7"),
-    "bcg": ("BCG Coverage", "sB79w2hiLp8"),
-    # HIV / TB
-    "hiv": ("HIV+ Pregnant Women on ART", "ybzlGLjWwnK"),
-    "hiv positive": ("HIV Positive Cases", "ybzlGLjWwnK"),
-    "tb": ("TB Cases Notified", "XocrRn044Xo"),
-    "tuberculosis": ("TB Cases Notified", "XocrRn044Xo"),
-    "tb treatment": ("TB Treatment Success Rate", "pvnD3hWxpnp"),
-    # Cholera / Outbreaks
-    "cholera": ("Cholera Suspected Cases", "vc6J1qOWsNR"),
-    "outbreak": ("Outbreak Cases Reported", "TpRByWxcTDe"),
-    # Nutrition
-    "stunting": ("Stunting Rate Under 5", "noIzB569hTM"),
-    "wasting": ("Wasting Rate Under 5", "DU3nEmDTW5W"),
-    "malnutrition": ("Acute Malnutrition Cases", "N9nMEFpGPMb"),
-    "sam": ("Severe Acute Malnutrition", "TpRByWxcTBx"),
-    # Maternal / Child
-    "skilled birth": ("Skilled Birth Attendance", "n6aMJNLdvep"),
-    "facility delivery": ("Facility Delivery Rate", "A03MvHHogjR"),
-    "maternal death": ("Maternal Deaths", "O05mAByOgAv"),
-    "under 5 mortality": ("Under 5 Mortality Rate", "pk7bUK5c1Hb"),
-    "neonatal": ("Neonatal Mortality Rate", "zGbLIFja9Nd"),
-    # Coverage
-    "coverage": ("Health Service Coverage Rate", "Jtf34kNZhzP"),
-    "coverage rate": ("Health Service Coverage Rate", "Jtf34kNZhzP"),
-}
-
 PERIOD_RE = re.compile(r"\b(20\d{2})(?:\s*[-/]?\s*(q[1-4]))?\b", re.I)
-ORG_UNIT_RE = re.compile(
-    r"\b(national|federal|state|district|lga|ward|facility)\b", re.I
-)
-# Extend with a broader place-name list for production deployments
-PLACE_RE = re.compile(
-    r"\b(kaduna|kano|sokoto|lagos|abuja|nigeria|oyo|rivers|bauchi|borno|zamfara"
-    r"|yobe|kebbi|nasarawa|plateau|kogi|kwara|enugu|anambra|imo|abia|cross river"
-    r"|akwa ibom|delta|edo|ondo|ogun|ekiti|osun|ghana|kenya|uganda|tanzania|ethiopia"
-    r"|rwanda|malawi|zambia|zimbabwe|mozambique|niger|burkina faso|mali|senegal"
-    r"|côte d.ivoire|cameroon|south africa|angola|drc|congo)\b",
+
+# Generic org-unit level keywords (DHIS2-standard, not instance-specific)
+ORG_UNIT_LEVEL_RE = re.compile(
+    r"\b(national|federal|country|state|province|region|county|district|lga"
+    r"|sub-?county|zone|ward|facility|health\s*centre|clinic|hospital)\b",
     re.I,
+)
+
+# Extract a location name from patterns like "in Bo district", "for Kaduna state"
+_ORG_UNIT_NL_RE = re.compile(
+    r"(?:\b(?:in|for|at|from|of|across)\b\s+(?:the\s+)?)([A-Z][a-zA-Z\-']+(?:\s+[A-Z][a-zA-Z\-']+)*)",
 )
 
 # ---------------------------------------------------------------------------
@@ -181,8 +135,9 @@ def classify_intent(
 
     return {
         "output_mode": output_mode,
-        "metrics": _detect_metrics(lowered),
-        "org_unit": _detect_org_unit(text),
+        "requires_data": bool(text),
+        "metrics": _extract_metric_labels(lowered),
+        "org_unit": _extract_org_unit(text),
         "periods": periods,
         "disaggregations": [],
         "viz_types": _detect_viz_types(lowered, output_mode),
@@ -274,7 +229,20 @@ Web enrichment: true for WHO guidelines, benchmarks, outbreak context, policy, e
         json_mode=True,
         temperature=0.1,
     )
-    parsed = json.loads(raw)
+    try:
+        parsed = json.loads(raw)
+    except json.JSONDecodeError:
+        # LLMs sometimes wrap JSON in markdown fences — strip and retry
+        cleaned = re.sub(r"^```(?:json)?\s*", "", raw.strip())
+        cleaned = re.sub(r"\s*```$", "", cleaned)
+        try:
+            parsed = json.loads(cleaned)
+        except json.JSONDecodeError:
+            logger.warning(
+                "llm_intent_json_fallback",
+                extra={"raw_preview": raw[:200], "message": message[:100]},
+            )
+            return classify_intent(message, forced_mode=forced_mode, today=now)
     return _merge_llm_intent(parsed, forced_mode, now)
 
 
@@ -295,44 +263,78 @@ def _detect_output_mode(text: str) -> OutputMode:
     return "conversational"
 
 
-def _detect_metrics(text: str) -> list[dict[str, Any]]:
-    found: list[dict[str, Any]] = []
-    seen_uids: set[str] = set()
-    for key, (label, uid) in KNOWN_METRICS.items():
-        if key in text and uid not in seen_uids:
-            found.append({
-                "label": label,
-                "uid": uid,
-                "uid_confidence": 0.90,
-                "object_type": "indicator",
-            })
-            seen_uids.add(uid)
-    return found or [{
-        "label": "Health Service Coverage Rate",
-        "uid": "Jtf34kNZhzP",
-        "uid_confidence": 0.60,
+def _extract_metric_labels(text: str) -> list[dict[str, Any]]:
+    """Extract health indicator labels from natural language.
+
+    No hardcoded UIDs — returns UNRESOLVED markers for the metadata resolver
+    to look up from whichever DHIS2 instance is connected.
+    """
+    # Strip temporal/location noise to isolate the health topic
+    cleaned = text
+    for noise in ("show me", "give me", "what is", "what are", "how many",
+                  "table of", "trend of", "compare", "last", "this",
+                  "over the", "in the", "for the", "month", "year",
+                  "quarter", "week", "district", "state", "national"):
+        cleaned = cleaned.replace(noise, " ")
+    cleaned = re.sub(r"\s+", " ", cleaned).strip()
+
+    if not cleaned:
+        cleaned = text  # fall back to full message
+
+    return [{
+        "label": cleaned,
+        "uid": "UNRESOLVED",
+        "uid_confidence": 0.40,
         "object_type": "indicator",
     }]
 
 
-def _detect_org_unit(text: str) -> dict[str, Any]:
-    place_match = PLACE_RE.search(text)
-    if place_match:
-        label = place_match.group(0).title()
-        uid = re.sub(r"[^A-Z0-9]", "_", label.upper())
-        # Simple level heuristic — real deployments should look up via API
-        country_terms = {"nigeria", "ghana", "kenya", "uganda", "ethiopia", "tanzania"}
-        level = 1 if label.lower() in country_terms else 2
-        return {"label": label, "uid": uid, "level": level}
+def _extract_org_unit(text: str) -> dict[str, Any]:
+    """Extract organisation unit from natural language.
 
-    level_match = ORG_UNIT_RE.search(text.lower())
+    Uses generic preposition patterns (in/for/at X) — no hardcoded place names.
+    The metadata resolver will look up the real UID from the synced DHIS2 DB.
+    """
+    # Try "in <Place>" / "for <Place>" pattern
+    match = _ORG_UNIT_NL_RE.search(text)
+    if match:
+        label = match.group(1).strip()
+        # Strip trailing level keywords like "district", "state"
+        label = ORG_UNIT_LEVEL_RE.sub("", label).strip() or label
+        if label.lower() not in {"the", "a", "an", "this", "that", "last", "next"}:
+            # Infer level from context
+            level = _infer_org_level(text)
+            return {"label": label, "uid": "UNRESOLVED", "level": level}
+
+    # Check for bare level keywords
+    level_match = ORG_UNIT_LEVEL_RE.search(text.lower())
     if level_match:
         term = level_match.group(0).lower()
-        level_map = {"national": 1, "federal": 1, "state": 2, "district": 3, "lga": 3, "ward": 4, "facility": 5}
-        level = level_map.get(term, 2)
-        return {"label": term.title(), "uid": term.upper(), "level": level}
+        level = _level_from_keyword(term)
+        return {"label": "National" if level == 1 else term.title(), "uid": "UNRESOLVED", "level": level}
 
-    return {"label": "National", "uid": "NATIONAL", "level": 1}
+    return {"label": "National", "uid": "UNRESOLVED", "level": 1}
+
+
+def _infer_org_level(text: str) -> int:
+    """Infer the DHIS2 org hierarchy level from context keywords."""
+    lowered = text.lower()
+    level_match = ORG_UNIT_LEVEL_RE.search(lowered)
+    if level_match:
+        return _level_from_keyword(level_match.group(0).lower())
+    return 2  # default to sub-national
+
+
+def _level_from_keyword(term: str) -> int:
+    """Map an org-unit type keyword to a DHIS2 hierarchy level."""
+    level_map = {
+        "national": 1, "federal": 1, "country": 1,
+        "state": 2, "province": 2, "region": 2, "county": 2,
+        "district": 3, "lga": 3, "sub-county": 3, "subcounty": 3, "zone": 3,
+        "ward": 4,
+        "facility": 5, "health centre": 5, "healthcentre": 5, "clinic": 5, "hospital": 5,
+    }
+    return level_map.get(term, 2)
 
 
 def _detect_periods(text: str, today: date) -> list[str]:
@@ -433,8 +435,6 @@ def _merge_llm_intent(parsed: dict, forced_mode: OutputMode | None, today: date)
             m.setdefault("object_type", "indicator")
 
     org_label = parsed.get("org_unit_label", "National")
-    # Store placeholder UID — will be resolved by metadata_resolve node
-    org_uid = re.sub(r"[^A-Z0-9]", "_", org_label.upper())
 
     # Validate and normalise periods — accept both fixed and relative codes
     raw_periods = parsed.get("periods") or []
@@ -454,7 +454,7 @@ def _merge_llm_intent(parsed: dict, forced_mode: OutputMode | None, today: date)
         "output_mode": forced_mode or parsed.get("output_mode", "conversational"),
         "requires_data": parsed.get("requires_data", True),
         "metrics": metrics,
-        "org_unit": {"label": org_label, "uid": org_uid, "level": 1 if org_label.lower() in {"national", "federal"} else 2},
+        "org_unit": {"label": org_label, "uid": "UNRESOLVED", "level": 1 if org_label.lower() in {"national", "federal"} else 2},
         "periods": valid_periods,
         "disaggregations": [],
         "viz_types": ["bar", "line"],

@@ -115,6 +115,29 @@ async def lifespan(app: FastAPI):
     cleanup_old_files(settings)
     
     await init_db()
+
+    # --- DHIS2 connectivity check ---
+    if settings.dhis2_service_account_user:
+        try:
+            from backend.app.dhis2.client import DHIS2Client
+            client = DHIS2Client(settings)
+            info = await client.health_check()
+            logger.info(
+                "dhis2_health_ok",
+                extra={
+                    "version": info.get("version"),
+                    "revision": info.get("revision"),
+                    "base_url": settings.dhis2_base_url,
+                },
+            )
+        except Exception as exc:
+            logger.warning(
+                "dhis2_health_failed: DHIS2 instance is unreachable — "
+                "data queries will fail until this is fixed. "
+                f"URL: {settings.dhis2_base_url}",
+                extra={"error": str(exc)},
+            )
+
     sync_task = asyncio.create_task(_metadata_sync_loop())
     
     logger.info("startup", extra={"deployment_mode": settings.deployment_mode})

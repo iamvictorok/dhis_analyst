@@ -140,7 +140,20 @@ async def _llm_conversational(state: AgentState, settings: Settings) -> str:
     org_label = state.get("org_unit", {}).get("label", "National")
     periods = state.get("periods", [])
     period_text = ", ".join(periods)
-    
+
+    # Guard: if data was requested but nothing came back, say so honestly
+    if state.get("requires_data") and not rows:
+        return (
+            f"I was unable to retrieve any data for **{metric_label}** "
+            f"in **{org_label}** for the period(s) {period_text}.\n\n"
+            f"This may be because:\n"
+            f"- The indicator doesn't exist in this DHIS2 instance\n"
+            f"- The organisation unit name doesn't match\n"
+            f"- No data was reported for that period\n"
+            f"- The DHIS2 server was temporarily unreachable\n\n"
+            f"Please check the indicator name and try again."
+        )
+
     web_context = ""
     for ctx in state.get("web_context", []):
         if not ctx.get("url", "").startswith("local://"):

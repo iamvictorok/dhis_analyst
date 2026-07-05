@@ -218,6 +218,15 @@ async def run_agent_stream(
     else:
         logger.info("skipping_data_pipeline", extra={"reason": "requires_data=False", "session_id": state.get("session_id")})
 
+    # --- Empty data guard: refuse to hallucinate from nothing ---
+    if state["requires_data"] and not state.get("dhis2_data", {}).get("rows"):
+        mode = state["output_mode"]
+        if mode in ("report", "dashboard", "presentation", "export"):
+            yield sse("report_html", {"html": _no_data_html(state)})
+            logger.info("agent_done_no_data", extra={"session_id": state["session_id"], "mode": mode})
+            yield sse("done")
+            return
+
     # --- Content generation + routing ---
     try:
         state = await _timed_node("generate_content", generate_content, state, settings)
@@ -280,3 +289,26 @@ def _user_friendly_error(error_msg: str) -> str:
     if "ConnectError" in error_msg or "timeout" in error_msg.lower():
         return "Could not connect to the DHIS2 server."
     return "An unexpected error occurred while fetching data."
+
+
+def _no_data_html(state: AgentState) -> str:
+    """Structured HTML response when DHIS2 returned zero rows."""
+    metrics = state.get("metrics", [])
+    metric_label = metrics[0]["label"] if metrics else "the requested indicator"
+    org_label = state.get("org_unit", {}).get("label", "the selected area")
+    periods = ", ".join(state.get("periods", []))
+
+    return (
+        f"<h2>No Data Available</h2>"
+        f"<p>The DHIS2 server returned <strong>no data</strong> for "
+        f"<em>{metric_label}</em> in <strong>{org_label}</strong> "
+        f"for the period(s): <code>{periods}</code>.</p>"
+        f"<h3>Possible causes</h3>"
+        f"<ul>"
+        f"<li>The indicator name may not match any data element in this DHIS2 instance.</li>"
+        f"<li>The organisation unit may not exist or may have a different name.</li>"
+        f"<li>No data has been reported for the selected period.</li>"
+        f"<li>The DHIS2 instance may be temporarily unavailable.</li>"
+        f"</ul>"
+        f"<p>Please verify the indicator, location, and time period, then try again.</p>"
+    )
