@@ -284,10 +284,14 @@ async def chat(
             previous_messages = history
 
     formatted_history = []
-    for msg in previous_messages[-8:]:
+    for msg in previous_messages[-6:]:
+        content = msg["content"]
+        # Cap assistant responses — intent classifier needs topic context, not full reports
+        if msg["role"] == "assistant" and len(content) > 500:
+            content = content[:500] + "…"
         formatted_history.append({
             "role": msg["role"],
-            "content": msg["content"]
+            "content": content
         })
 
     return StreamingResponse(
