@@ -27,7 +27,7 @@ class AgentState(TypedDict):
     user_id: str
     user_role: Literal["dhis2_user", "external_stakeholder"]
 
-    output_mode: Literal["conversational", "dashboard", "report", "presentation", "export"]
+    output_mode: Literal["conversational", "dashboard", "report", "presentation", "export", "map"]
     metrics: list[MetricRef]
     org_unit: OrgUnitRef
     periods: list[str]
@@ -35,12 +35,13 @@ class AgentState(TypedDict):
     viz_types: list[str]
     needs_web_enrichment: bool
     web_search_queries: list[str]
-    data_retrieval_strategy: Literal["analytics_api", "direct_sql", "both"]
+    data_retrieval_strategy: Literal["analytics_api", "direct_sql", "both", "tracker_api", "data_value_sets"]
     clarification_needed: bool
     clarification_question: Optional[str]
     requires_data: bool
 
     dhis2_data: dict
+    pii_map: dict[str, str]
     web_context: list[dict]
     evidence_items: list[EvidenceItem]
 
@@ -49,3 +50,4 @@ class AgentState(TypedDict):
     active_slide_manifest: list[dict]
     generated_file_id: Optional[str]
     active_conversational_response: Optional[str]
+    fetch_error: Optional[str]

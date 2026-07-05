@@ -77,6 +77,12 @@ async def resolve_metadata(state: AgentState, settings: Settings) -> AgentState:
                 extra={"low_confidence_metrics": [m["label"] for m in low_confidence], "candidates": names},
             )
         else:
+            state["clarification_needed"] = True
+            missing_labels = ", ".join(m["label"] for m in low_confidence)
+            state["clarification_question"] = (
+                f"I couldn't find any health indicators matching '{missing_labels}' in this DHIS2 instance. "
+                f"Could you verify the indicator name and try again?"
+            )
             logger.info(
                 "metadata_low_confidence_no_candidates",
                 extra={"low_confidence_metrics": [m["label"] for m in low_confidence]},

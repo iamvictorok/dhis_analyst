@@ -102,6 +102,7 @@ async def build_initial_state(
         "clarification_question": intent["clarification_question"],
         "requires_data": intent.get("requires_data", True),
         "dhis2_data": {},
+        "pii_map": {},
         "web_context": [],
         "evidence_items": [],
         "active_report_html": "",
@@ -109,6 +110,7 @@ async def build_initial_state(
         "active_slide_manifest": [],
         "generated_file_id": None,
         "active_conversational_response": None,
+        "fetch_error": None,
     }
 
 
@@ -136,8 +138,16 @@ async def run_agent_stream(
     try:
         state = await build_initial_state(request, settings, identity, history)
     except Exception as exc:
-        logger.error("intent_classification_failed", extra={"error": str(exc)})
-        yield sse("error", {"code": "INTENT_FAILED", "user_message": "Could not understand your request. Please try rephrasing.", "detail": str(exc)})
+        logger.error("intent_classification_failed", extra={"error": str(exc)}, exc_info=True)
+        error_str = str(exc).lower()
+        if "timeout" in error_str:
+            msg = "The AI provider timed out while processing your request. Please try again."
+        elif "rate limit" in error_str or "429" in error_str:
+            msg = "The AI provider is currently rate limited. Please wait a moment and try again."
+        else:
+            msg = "Could not understand your request due to an AI parsing error. Please try rephrasing."
+        
+        yield sse("error", {"code": "INTENT_FAILED", "user_message": msg, "detail": str(exc)})
         yield sse("done")
         return
 
@@ -167,7 +177,10 @@ async def run_agent_stream(
         try:
             state = await _timed_node("fetch_dhis2", fetch_dhis2, state, settings)
         except Exception as exc:
-            error_msg = str(exc)
+            if hasattr(exc, "response") and hasattr(exc.response, "text"):
+                error_msg = f"HTTP {exc.response.status_code} - {exc.response.text}"
+            else:
+                error_msg = str(exc)
             is_period_error = "409" in error_msg and "period" in error_msg.lower()
 
             if is_period_error:
@@ -184,17 +197,21 @@ async def run_agent_stream(
                     state = await _timed_node("fetch_dhis2_retry", fetch_dhis2, state, settings)
                 except Exception as retry_exc:
                     logger.error("fetch_dhis2_retry_failed", extra={"error": str(retry_exc)})
+                    friendly_error = _user_friendly_error(str(retry_exc))
+                    state["fetch_error"] = friendly_error
                     yield sse("error", {
                         "code": "DATA_FETCH_FAILED",
-                        "user_message": "Could not retrieve DHIS2 data even with fallback period. The server may be unavailable.",
+                        "user_message": f"Could not retrieve DHIS2 data even with fallback period: {friendly_error}",
                         "detail": str(retry_exc),
                     })
                     # Non-fatal — continue with empty data
             else:
                 logger.error("fetch_dhis2_failed", extra={"error": error_msg})
+                friendly_error = _user_friendly_error(error_msg)
+                state["fetch_error"] = friendly_error
                 yield sse("error", {
                     "code": "DATA_FETCH_FAILED",
-                    "user_message": f"Could not retrieve DHIS2 data: {_user_friendly_error(error_msg)}",
+                    "user_message": f"Could not retrieve DHIS2 data: {friendly_error}",
                     "detail": error_msg,
                 })
                 # Non-fatal — continue with empty data
@@ -221,7 +238,7 @@ async def run_agent_stream(
     # --- Empty data guard: refuse to hallucinate from nothing ---
     if state["requires_data"] and not state.get("dhis2_data", {}).get("rows"):
         mode = state["output_mode"]
-        if mode in ("report", "dashboard", "presentation", "export"):
+        if mode in ("report", "dashboard", "presentation", "export", "map"):
             yield sse("report_html", {"html": _no_data_html(state)})
             logger.info("agent_done_no_data", extra={"session_id": state["session_id"], "mode": mode})
             yield sse("done")
@@ -242,7 +259,7 @@ async def run_agent_stream(
         for chart in state["active_chart_configs"]:
             yield sse("chart_config", chart)
             await asyncio.sleep(0)
-    elif mode == "report":
+    elif mode in ("report", "map"):
         yield sse("report_html", {"html": state["active_report_html"]})
     elif mode == "presentation":
         yield sse("slide_manifest", state["active_slide_manifest"])
@@ -278,6 +295,12 @@ def _chunk(text: str, size: int) -> list[str]:
 
 def _user_friendly_error(error_msg: str) -> str:
     """Extract a user-friendly message from a DHIS2 error."""
+    if "409" in error_msg and "aggregation type" in error_msg.lower():
+        return "This specific data element cannot be aggregated over time or locations. Please try a different metric that represents a count or number."
+    if "409" in error_msg and "referenced table does not exist" in error_msg.lower():
+        return "The analytics tables for this data have not been generated in DHIS2. Please ensure the DHIS2 analytics export job has been run."
+    if "409" in error_msg and "dimension is present" in error_msg.lower():
+        return "The query was constructed with a dimension that has no valid options. This usually means the health indicator could not be correctly identified in the DHIS2 instance."
     if "409" in error_msg and "period" in error_msg.lower():
         return "The requested time period was not recognized by DHIS2."
     if "404" in error_msg:
@@ -297,6 +320,18 @@ def _no_data_html(state: AgentState) -> str:
     metric_label = metrics[0]["label"] if metrics else "the requested indicator"
     org_label = state.get("org_unit", {}).get("label", "the selected area")
     periods = ", ".join(state.get("periods", []))
+
+    if state.get("fetch_error"):
+        return (
+            f"<h2>Data Retrieval Error</h2>"
+            f"<p>The DHIS2 server could not process the request for "
+            f"<em>{metric_label}</em> in <strong>{org_label}</strong> "
+            f"for the period(s): <code>{periods}</code>.</p>"
+            f"<div style='margin-top: 1rem; padding: 1rem; background-color: #fef2f2; color: #991b1b; border-left: 4px solid #dc2626; border-radius: 4px;'>"
+            f"<strong>Error Detail:</strong> {state['fetch_error']}"
+            f"</div>"
+            f"<p style='margin-top: 1rem;'>Please verify your request parameters and try again.</p>"
+        )
 
     return (
         f"<h2>No Data Available</h2>"

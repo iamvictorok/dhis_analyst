@@ -18,16 +18,24 @@ def build_analytics_params(state: AgentState) -> dict[str, Any]:
         }
     )
     dx = ",".join(m["uid"] for m in state["metrics"])
-    ou = f"LEVEL-{state['org_unit']['level']};{state['org_unit']['uid']}"
+    
+    ou_level = state["org_unit"]["level"]
+    disaggregations = state.get("disaggregations", [])
+    if "ou_children" in disaggregations:
+        ou_level += 1
+        disaggregations = [d for d in disaggregations if d != "ou_children"]
+        
+    ou = f"LEVEL-{ou_level};{state['org_unit']['uid']}"
     pe = ",".join(state["periods"])
+    
     params: dict[str, Any] = {
         "dimension": [f"dx:{dx}", f"ou:{ou}", f"pe:{pe}"],
         "displayProperty": "NAME",
         "outputIdScheme": "NAME",
         "skipMeta": "false",
     }
-    if state["disaggregations"]:
-        params["dimension"].append(f"co:{','.join(state['disaggregations'])}")
+    if disaggregations:
+        params["dimension"].append(f"co:{','.join(disaggregations)}")
     logger.info("build_analytics_params_complete", extra={"params": params})
     return params
 

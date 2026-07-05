@@ -50,6 +50,22 @@ class DHIS2Client:
         """Query the DHIS2 Analytics API."""
         return await self._get("/api/analytics.json", params=params)
 
+    async def tracker(self, params: dict[str, Any]) -> dict[str, Any]:
+        """Query the DHIS2 Tracker Events API."""
+        return await self._get("/api/tracker/events.json", params=params)
+        
+    async def data_value_sets(self, params: dict[str, Any]) -> dict[str, Any]:
+        """Query the DHIS2 Data Value Sets API for raw data."""
+        return await self._get("/api/dataValueSets.json", params=params)
+
+    async def geojson(self, level: int, parent_uid: str) -> dict[str, Any]:
+        """Fetch GeoJSON boundaries for organisation units."""
+        params = {
+            "level": level,
+            "parent": parent_uid
+        }
+        return await self._get("/api/organisationUnits.geojson", params=params)
+
     async def metadata(
         self,
         endpoint: str,

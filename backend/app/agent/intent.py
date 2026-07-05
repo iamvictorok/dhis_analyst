@@ -171,26 +171,25 @@ Today is {now.isoformat()}. Analyse the user query and return ONLY a JSON object
 CRITICAL RULES FOR FOLLOW-UP QUERIES:
 - If the user refers to something from the conversation history (e.g. "What about 2025?", "Show me Lagos instead"), carry over the unmentioned fields from the context and only update what changed.
 - If the query is general, conversational, or discusses prior data (e.g. "explain this trend", "why?"), use output_mode "conversational" and carry over the relevant context.
+- If the user asks a COMPLETELY NEW question that does NOT refer to the previous history (e.g. asking for a different indicator or entirely different topic), DO NOT carry over anything from the history. Reset all fields (metrics, periods, etc.) to match only the new question.
 
-Available output modes:
-- conversational: general Q&A, analysis, explanations, follow-up comments on data
-- dashboard: charts, trend visualisations, comparisons
-- report: formal briefings, programme reviews, monthly reports
-- presentation: slide decks, briefing decks
-- export: raw data extraction, Excel/CSV downloads
-
-IMPORTANT — Metric handling:
-- Output metric LABELS only. Do NOT invent or guess UIDs. Set uid to null.
-- The metadata pipeline will resolve real UIDs from the synced DHIS2 database.
-- Use descriptive health indicator names (e.g. "Malaria confirmed cases", "ANC 1st visit", "OPV3 coverage").
+Output mode — use ONE of:
+- conversational: simple chat, Q&A, general questions
+- dashboard: request for charts, visuals, comparisons over time
+- report: request for a formal narrative document or summary
+- presentation: request for slide deck or presentation
+- export: request to download raw data (CSV, Excel, etc)
+- map: request for a geospatial map, heat map, or geographical distribution
 
 Return JSON with these exact keys:
 {{
-  "output_mode": "<one of the 5 modes>",
+  "output_mode": "<one of the 6 modes>",
   "requires_data": <true/false>,
   "metrics": [{{"label": "<indicator name>", "uid": null, "object_type": "indicator"}}],
   "org_unit_label": "<detected location or 'National'>",
   "periods": ["<DHIS2 period code>"],
+  "disaggregations": ["<disaggregation token, e.g. ou_children>"],
+  "data_retrieval_strategy": "<analytics_api or tracker_api>",
   "needs_web_enrichment": <true/false>,
   "web_search_queries": ["<search query>"],
   "clarification_needed": <true/false>,
@@ -198,6 +197,8 @@ Return JSON with these exact keys:
 }}
 
 requires_data: set to true when the query needs DHIS2 data retrieval (e.g. health statistics, trends, comparisons, reports, exports). Set to false for casual chitchat, greetings, thank-yous, general knowledge questions, or meta-questions about the system that do NOT need health data from DHIS2.
+disaggregations: If the user explicitly asks to break down data spatially (e.g., "across all districts", "by region", "compare clinics"), include "ou_children". Otherwise leave it empty []. For time trends, use relative period codes (e.g. MONTHS_THIS_YEAR) instead of disaggregations.
+data_retrieval_strategy: Use "tracker_api" ONLY if the user explicitly asks for line lists, individual patient records, specific patient events, or un-aggregated dates (e.g., "date of previous malaria episode"). Use "data_value_sets" ONLY if the user explicitly asks for raw data validation, missing reports, or data entry errors before aggregation. Otherwise, always use "analytics_api" for aggregated totals, summaries, and percentages.
 
 Period codes — use ONE of:
 1. Fixed periods: quarterly=YYYYQn, annual=YYYY, weekly=YYYYWww, monthly=YYYYMM.
@@ -223,12 +224,17 @@ Web enrichment: true for WHO guidelines, benchmarks, outbreak context, policy, e
             llm_messages.append({"role": msg["role"], "content": msg["content"]})
     llm_messages.append({"role": "user", "content": message})
 
-    raw = await complete(
-        llm_messages,
-        settings,
-        json_mode=True,
-        temperature=0.1,
-    )
+    try:
+        raw = await complete(
+            llm_messages,
+            settings,
+            json_mode=True,
+            temperature=0.1,
+        )
+    except Exception as exc:
+        logger.warning("llm_intent_complete_failed", extra={"error": str(exc)})
+        return classify_intent(message, forced_mode=forced_mode, today=now)
+        
     try:
         parsed = json.loads(raw)
     except json.JSONDecodeError:
@@ -243,6 +249,13 @@ Web enrichment: true for WHO guidelines, benchmarks, outbreak context, policy, e
                 extra={"raw_preview": raw[:200], "message": message[:100]},
             )
             return classify_intent(message, forced_mode=forced_mode, today=now)
+            
+    if isinstance(parsed, list):
+        if len(parsed) > 0 and isinstance(parsed[0], dict):
+            parsed = parsed[0]
+        else:
+            return classify_intent(message, forced_mode=forced_mode, today=now)
+            
     return _merge_llm_intent(parsed, forced_mode, now)
 
 
@@ -456,11 +469,11 @@ def _merge_llm_intent(parsed: dict, forced_mode: OutputMode | None, today: date)
         "metrics": metrics,
         "org_unit": {"label": org_label, "uid": "UNRESOLVED", "level": 1 if org_label.lower() in {"national", "federal"} else 2},
         "periods": valid_periods,
-        "disaggregations": [],
+        "disaggregations": parsed.get("disaggregations") or [],
         "viz_types": ["bar", "line"],
         "needs_web_enrichment": bool(parsed.get("needs_web_enrichment")),
         "web_search_queries": parsed.get("web_search_queries") or [],
-        "data_retrieval_strategy": "analytics_api",
+        "data_retrieval_strategy": parsed.get("data_retrieval_strategy", "analytics_api"),
         "clarification_needed": bool(parsed.get("clarification_needed")),
         "clarification_question": parsed.get("clarification_question"),
     }
