@@ -455,6 +455,46 @@ h1, h2, h3, h4 { font-weight: 600; letter-spacing: -0.01em; }
   border-radius: 10px;
 }
 
+/* Copy button — shown on hover (ChatGPT-style) */
+.copy-btn {
+  opacity: 0;
+  transition: opacity var(--transition), background var(--transition);
+  min-height: 28px;
+  padding: 0 8px;
+  font-size: 0.75rem;
+}
+
+.copy-btn--copied {
+  opacity: 1;
+  color: var(--success);
+}
+
+.message-bubble:hover .copy-btn,
+.artefact-section-head:hover .copy-btn {
+  opacity: 1;
+}
+
+/* Action bar under assistant message text */
+.message-actions {
+  display: flex;
+  gap: 4px;
+  margin-top: 4px;
+  padding-top: 2px;
+}
+
+/* Artefact-level action group (copy + download grouped) */
+.artefact-actions {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+}
+
+.artefact-actions .download-bar {
+  display: flex;
+  gap: 4px;
+}
+
+
 /* Sources inline */
 .sources-section {
   border: 1px solid var(--border);

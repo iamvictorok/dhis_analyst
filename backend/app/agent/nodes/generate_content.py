@@ -120,6 +120,21 @@ async def _llm_conversational(state: AgentState, settings: Settings) -> str:
     data = state.get("dhis2_data", {})
     rows = data.get("rows", [])
     headers = data.get("headers", [])
+
+    # --- Casual chitchat path: no data pipeline was run ---
+    if not state.get("requires_data") and not rows:
+        system_prompt = (
+            "You are DHIS2 AI Analyst, an expert public health intelligence assistant. "
+            "The user has sent a casual or general message. Respond warmly, briefly, "
+            "and ask how you can help with their DHIS2 public health data analysis needs. "
+            "Use markdown formatting."
+        )
+        llm_messages = [{"role": "system", "content": system_prompt}]
+        for msg in state.get("messages", []):
+            llm_messages.append({"role": msg["role"], "content": msg["content"]})
+        return await complete(llm_messages, settings, temperature=0.5)
+
+    # --- Data-backed response path ---
     metrics = state.get("metrics", [])
     metric_label = metrics[0]["label"] if metrics else "Health Indicator"
     org_label = state.get("org_unit", {}).get("label", "National")
@@ -157,7 +172,6 @@ If they asked a follow-up question, use the data to answer it. Do not include su
 """
     
     llm_messages = [{"role": "system", "content": system_prompt}]
-    # Pass all messages EXCEPT the last one as history (since the last one is the current query, which we pass as prompt)
     history_messages = state.get("messages", [])[:-1]
     for msg in history_messages:
         llm_messages.append({

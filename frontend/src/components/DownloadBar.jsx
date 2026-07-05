@@ -1,6 +1,7 @@
 /**
  * Download bar — DOCX / PDF / PPTX / XLSX / CSV buttons.
  * POSTs the current report HTML or slide manifest to backend generator endpoints.
+ * When allowedFormats is provided, only those format buttons are shown.
  */
 import { useState, useCallback } from 'preact/hooks';
 import { getAuth } from '../auth/standaloneAuth.js';
@@ -13,7 +14,7 @@ const FORMATS = [
   { label: 'CSV', endpoint: '/api/export/csv', key: 'export' },
 ];
 
-export default function DownloadBar({ reportHtml, slides, exportData }) {
+export default function DownloadBar({ reportHtml, slides, exportData, allowedFormats }) {
   const [busy, setBusy] = useState('');
 
   const handleDownload = useCallback(async (fmt) => {
@@ -62,12 +63,16 @@ export default function DownloadBar({ reportHtml, slides, exportData }) {
     }
   }, [reportHtml, slides, exportData]);
 
+  const visibleFormats = allowedFormats
+    ? FORMATS.filter(f => allowedFormats.includes(f.label))
+    : FORMATS;
+
   const hasContent = reportHtml || (slides && slides.length) || exportData;
   if (!hasContent) return null;
 
   return (
     <div class="download-bar">
-      {FORMATS.map((fmt) => {
+      {visibleFormats.map((fmt) => {
         const enabled =
           (fmt.key === 'report' && reportHtml) ||
           (fmt.key === 'slides' && slides?.length) ||

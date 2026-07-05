@@ -22,6 +22,7 @@ import { readSseStream } from './lib/stream.js';
 import Dashboard from './components/Dashboard.jsx';
 import ReportEditor from './components/ReportEditor.jsx';
 import DownloadBar from './components/DownloadBar.jsx';
+import CopyButton from './components/CopyButton.jsx';
 import EvidenceTag from './components/EvidenceTag.jsx';
 import ClarificationPrompt from './components/ClarificationPrompt.jsx';
 import LoginModal from './components/LoginModal.jsx';
@@ -388,14 +389,6 @@ function App() {
     return <LoginModal onLogin={handleLogin} />;
   }
 
-  // Derive download bar data from current messages
-  const allArtefacts = messages
-    .filter(m => m.role === 'assistant' && m.artefacts)
-    .map(m => m.artefacts);
-  const lastArtefacts = allArtefacts[allArtefacts.length - 1];
-  const currentReportHtml = lastArtefacts?.reportHtml || '';
-  const currentSlides = lastArtefacts?.slides || [];
-  const currentExportData = lastArtefacts?.exportData || null;
 
   return (
     <div class="layout">
@@ -425,11 +418,6 @@ function App() {
             </h1>
           </div>
           <div class="main-header-right">
-            <DownloadBar
-              reportHtml={currentReportHtml}
-              slides={currentSlides}
-              exportData={currentExportData}
-            />
             <button class="btn-sm" onClick={handleLogout}>Logout</button>
           </div>
         </header>
@@ -513,6 +501,11 @@ function MessageBlock({ msg, isLast, isLoading }) {
             <span class="typing-dot" />
           </span>
         ) : '')}
+        {!isUser && msg.content && (
+          <div class="message-actions">
+            <CopyButton text={msg.content} label="Copy" />
+          </div>
+        )}
       </div>
 
       {/* Inline artefacts — only for assistant messages */}
@@ -524,6 +517,12 @@ function MessageBlock({ msg, isLast, isLoading }) {
                 <div style="display: flex; align-items: center; gap: 8px;">
                   <h3>📊 Dashboard</h3>
                   <span class="badge">{art.charts.length} chart{art.charts.length !== 1 ? 's' : ''}</span>
+                </div>
+                <div class="artefact-actions">
+                  <CopyButton
+                    text={JSON.stringify(art.charts.map(c => ({ id: c.id, title: c.layout?.title, series: c.series })), null, 2)}
+                    label="Copy data"
+                  />
                 </div>
               </div>
               <Dashboard charts={art.charts} />
@@ -537,7 +536,10 @@ function MessageBlock({ msg, isLast, isLoading }) {
                   <h3>📄 Report</h3>
                   <span class="badge">Editable</span>
                 </div>
-                <DownloadBar reportHtml={art.reportHtml} allowedFormats={['DOCX', 'PDF']} />
+                <div class="artefact-actions">
+                  <CopyButton text={art.reportHtml} label="Copy HTML" />
+                  <DownloadBar reportHtml={art.reportHtml} allowedFormats={['DOCX', 'PDF']} />
+                </div>
               </div>
               <ReportEditor html={art.reportHtml} onChange={() => {}} />
             </div>
@@ -550,7 +552,10 @@ function MessageBlock({ msg, isLast, isLoading }) {
                   <h3>🎴 Presentation Slides</h3>
                   <span class="badge">{art.slides.length} slides</span>
                 </div>
-                <DownloadBar slides={art.slides} allowedFormats={['PPTX']} />
+                <div class="artefact-actions">
+                  <CopyButton text={JSON.stringify(art.slides, null, 2)} label="Copy slides" />
+                  <DownloadBar slides={art.slides} allowedFormats={['PPTX']} />
+                </div>
               </div>
               <div class="slides-preview-wrapper" style="overflow-x: auto; display: flex; gap: 12px; padding: 8px 0; margin-top: 8px;">
                 {art.slides.map((slide, sIdx) => (
@@ -574,7 +579,16 @@ function MessageBlock({ msg, isLast, isLoading }) {
                   <h3>📋 Export Data</h3>
                   <span class="badge">{(art.exportData.rows || []).length} rows</span>
                 </div>
-                <DownloadBar exportData={art.exportData} allowedFormats={['XLSX', 'CSV']} />
+                <div class="artefact-actions">
+                  <CopyButton
+                    text={[
+                      (art.exportData.headers || []).join('\t'),
+                      ...(art.exportData.rows || []).map(r => r.join('\t')),
+                    ].join('\n')}
+                    label="Copy table"
+                  />
+                  <DownloadBar exportData={art.exportData} allowedFormats={['XLSX', 'CSV']} />
+                </div>
               </div>
               <div class="export-preview-table-wrapper" style="overflow-x: auto; max-height: 250px; border: 1px solid var(--border-color); border-radius: 6px; background: var(--bg-primary); margin-top: 8px;">
                 <table class="export-preview-table" style="width: 100%; border-collapse: collapse; font-size: 0.85rem;">
