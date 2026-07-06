@@ -19,6 +19,9 @@ from backend.config import Settings
 
 logger = logging.getLogger("dhis2_analyst.dhis2_client")
 
+RETRYABLE_STATUS_CODES = {429, 500, 502, 503, 504}
+MAX_ATTEMPTS = 3
+
 
 class DHIS2Client:
     def __init__(self, settings: Settings, token: str | None = None) -> None:
@@ -40,7 +43,7 @@ class DHIS2Client:
 
         return {
             "base_url": self._base_url,
-            "timeout": 30.0,
+            "timeout": httpx.Timeout(30.0, connect=10.0, read=30.0),
             "auth": auth,
             "headers": headers,
             "follow_redirects": True,
@@ -104,16 +107,31 @@ class DHIS2Client:
         return await self._get("/api/system/info.json")
 
     async def _get(self, path: str, params: dict[str, Any] | None = None) -> dict[str, Any]:
-        """GET with 1 retry on connection error."""
+        """GET with bounded retries on transient transport and server errors."""
         kwargs = self._build_client_kwargs()
         last_exc: Exception | None = None
 
-        for attempt in range(2):
+        for attempt in range(MAX_ATTEMPTS):
             start = time.monotonic()
             try:
                 async with httpx.AsyncClient(**kwargs) as client:
                     response = await client.get(path, params=params)
+                    if response.status_code in RETRYABLE_STATUS_CODES and attempt < MAX_ATTEMPTS - 1:
+                        logger.warning(
+                            "dhis2_request_retryable_status",
+                            extra={
+                                "path": path,
+                                "status": response.status_code,
+                                "attempt": attempt + 1,
+                                "duration_ms": int((time.monotonic() - start) * 1000),
+                            },
+                        )
+                        await _sleep_before_retry(attempt)
+                        continue
                     response.raise_for_status()
+                    payload = response.json()
+                    if not isinstance(payload, dict):
+                        raise ValueError("DHIS2 returned a non-object JSON payload.")
                     logger.info(
                         "dhis2_request_ok",
                         extra={
@@ -121,16 +139,19 @@ class DHIS2Client:
                             "status": response.status_code,
                             "attempt": attempt + 1,
                             "duration_ms": int((time.monotonic() - start) * 1000),
+                            "params_shape": _params_shape(params),
+                            "row_count": len(payload.get("rows", [])) if isinstance(payload, dict) else None,
                         },
                     )
-                    return response.json()
-            except httpx.ConnectError as exc:
+                    return payload
+            except (httpx.ConnectError, httpx.ReadTimeout, httpx.ConnectTimeout) as exc:
                 last_exc = exc
-                if attempt == 0:
+                if attempt < MAX_ATTEMPTS - 1:
                     logger.warning(
-                        "dhis2_connect_retry",
-                        extra={"path": path, "attempt": attempt + 1},
+                        "dhis2_transport_retry",
+                        extra={"path": path, "attempt": attempt + 1, "error_type": type(exc).__name__},
                     )
+                    await _sleep_before_retry(attempt)
                     continue
             except httpx.HTTPStatusError as exc:
                 body = exc.response.text[:500]
@@ -153,6 +174,7 @@ class DHIS2Client:
                         extra={
                             "path": path,
                             "full_url": f"{self._base_url}{path}",
+                            "params_shape": _params_shape(params),
                             "status": exc.response.status_code,
                             "duration_ms": int((time.monotonic() - start) * 1000),
                         },
@@ -161,8 +183,27 @@ class DHIS2Client:
             except Exception as exc:
                 logger.error(
                     "dhis2_request_error",
-                    extra={"path": path, "error": str(exc)},
+                    extra={"path": path, "params_shape": _params_shape(params), "error": str(exc)},
+                    exc_info=True
                 )
                 raise
 
-        raise last_exc or RuntimeError(f"DHIS2 request failed after retries: {path}")
+        raise last_exc or RuntimeError(f"DHIS2 request failed after {MAX_ATTEMPTS} attempts: {path}")
+
+
+async def _sleep_before_retry(attempt: int) -> None:
+    import asyncio
+
+    await asyncio.sleep(0.25 * (attempt + 1))
+
+
+def _params_shape(params: dict[str, Any] | None) -> dict[str, Any]:
+    if not params:
+        return {}
+    shaped: dict[str, Any] = {}
+    for key, value in params.items():
+        if isinstance(value, list):
+            shaped[key] = {"count": len(value), "values": value}
+        else:
+            shaped[key] = value
+    return shaped

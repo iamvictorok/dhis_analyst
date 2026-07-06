@@ -206,7 +206,16 @@ async def run_agent_stream(
                     })
                     # Non-fatal — continue with empty data
             else:
-                logger.error("fetch_dhis2_failed", extra={"error": error_msg})
+                logger.error(
+                    "fetch_dhis2_failed", 
+                    extra={
+                        "error": error_msg,
+                        "metrics": state.get("metrics"),
+                        "periods": state.get("periods"),
+                        "org_unit": state.get("org_unit")
+                    },
+                    exc_info=True
+                )
                 friendly_error = _user_friendly_error(error_msg)
                 state["fetch_error"] = friendly_error
                 yield sse("error", {

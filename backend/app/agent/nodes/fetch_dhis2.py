@@ -82,35 +82,46 @@ async def _fetch_analytics(state: AgentState, client: DHIS2Client) -> dict:
 async def _fetch_tracker(state: AgentState, client: DHIS2Client) -> tuple[dict, dict[str, str]]:
     """Fetch tracker events and anonymize PII before it reaches the LLM."""
     import uuid
+
+    org_uid = state["org_unit"].get("uid", "")
+    if not org_uid or org_uid == "UNRESOLVED":
+        raise ValueError("Cannot fetch tracker events before organisation unit resolution succeeds.")
     
     params = {
-        "orgUnit": state["org_unit"]["uid"] if state["org_unit"].get("uid") != "UNRESOLVED" else "O6uvpzGd5pu", # Bo default
+        "orgUnit": org_uid,
         "pageSize": 50,
     }
     
     try:
         raw = await client.tracker(params)
-    except Exception as e:
-        logger.warning(f"Tracker API failed or returned 403: {e}")
-        raw = {"instances": []}
+    except Exception:
+        logger.warning(
+            "tracker_api_failed",
+            extra={"session_id": state.get("session_id"), "org_unit": params["orgUnit"]},
+            exc_info=True,
+        )
+        raise
         
     pii_map = {}
     rows = []
     
     # Extract instances (DHIS2 Tracker response structure varies by version)
     instances = raw.get("instances", [])
-    
-    # Mocking extraction and anonymization for demonstration purposes
-    # In a real DHIS2 system, we would parse TEI attributes for names/phones
+
     if not instances:
-        # Generate mock tracker data so the AI can analyze it
-        metric = state["metrics"][0]["label"] if state["metrics"] else "Malaria positive"
-        for i in range(5):
-            real_name = f"Jane Doe {i+1}" # This is the PII
-            token = f"Patient_{str(uuid.uuid4())[:6]}"
-            pii_map[token] = real_name # Save it in the map, DO NOT send to LLM
-            
-            rows.append([token, "2023-10-04", metric])
+        logger.info(
+            "tracker_api_empty",
+            extra={"session_id": state.get("session_id"), "org_unit": params["orgUnit"]},
+        )
+
+    for event in instances:
+        token = f"Patient_{str(uuid.uuid4())[:6]}"
+        pii_map[token] = event.get("trackedEntity", event.get("trackedEntityInstance", "unknown"))
+        rows.append([
+            token,
+            event.get("occurredAt") or event.get("eventDate") or event.get("createdAt"),
+            event.get("status", "UNKNOWN"),
+        ])
             
     return {
         "rows": rows,
@@ -125,32 +136,41 @@ async def _fetch_tracker(state: AgentState, client: DHIS2Client) -> tuple[dict, 
 
 async def _fetch_data_value_sets(state: AgentState, client: DHIS2Client) -> dict:
     """Fetch raw data entry values before aggregation."""
-    import random
-    
-    # We would need to resolve DataSets to do this properly, 
-    # but we will mock the query structure using the data element
+    org_uid = state["org_unit"].get("uid", "")
+    data_element_uid = state["metrics"][0]["uid"] if state["metrics"] else ""
+    if not org_uid or org_uid == "UNRESOLVED" or not data_element_uid or data_element_uid == "UNRESOLVED":
+        raise ValueError("Cannot fetch raw data values before metadata resolution succeeds.")
+
     params = {
-        "orgUnit": state["org_unit"]["uid"] if state["org_unit"].get("uid") != "UNRESOLVED" else "O6uvpzGd5pu",
-        "dataElement": state["metrics"][0]["uid"] if state["metrics"] else "Urz28endlF6",
+        "orgUnit": org_uid,
+        "dataElement": data_element_uid,
         "period": state["periods"][0] if state["periods"] else "THIS_YEAR"
     }
     
     try:
         raw = await client.data_value_sets(params)
-    except Exception as e:
-        logger.warning(f"DataValueSets API failed: {e}")
-        raw = {"dataValues": []}
+    except Exception:
+        logger.warning(
+            "data_value_sets_api_failed",
+            extra={
+                "session_id": state.get("session_id"),
+                "org_unit": params["orgUnit"],
+                "data_element": params["dataElement"],
+                "period": params["period"],
+            },
+            exc_info=True,
+        )
+        raise
         
     data_values = raw.get("dataValues", [])
     rows = []
     
-    if not data_values:
-        # Mock raw data entry responses (e.g. daily entry at a clinic)
-        metric = state["metrics"][0]["label"] if state["metrics"] else "Metric"
-        for i in range(7):
-            val = random.randint(0, 15)
-            status = "Verified" if val < 10 else "Suspiciously High"
-            rows.append([f"Day {i+1}", val, status])
+    for value in data_values:
+        rows.append([
+            value.get("period"),
+            value.get("value"),
+            value.get("storedBy") or value.get("lastUpdated") or "reported",
+        ])
             
     return {
         "rows": rows,

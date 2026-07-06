@@ -143,6 +143,10 @@ async def lifespan(app: FastAPI):
     logger.info("startup", extra={"deployment_mode": settings.deployment_mode})
     yield
     sync_task.cancel()
+    try:
+        await sync_task
+    except asyncio.CancelledError:
+        pass
     logger.info("shutdown")
 
 
@@ -199,6 +203,7 @@ async def audit_middleware(request: Request, call_next):
         logger.error(
             "request_unhandled_error",
             extra={"method": request.method, "path": path, "error": str(exc), "duration_ms": duration_ms, "client": client_key},
+            exc_info=True
         )
         raise
 
