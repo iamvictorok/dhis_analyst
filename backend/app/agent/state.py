@@ -51,3 +51,6 @@ class AgentState(TypedDict):
     generated_file_id: Optional[str]
     active_conversational_response: Optional[str]
     fetch_error: Optional[str]
+    # Raw DHIS2 personal access token for the current user, when authenticated
+    # in dhis2/combined mode; enables per-user DHIS2 API calls instead of mock.
+    _dhis2_token: Optional[str]

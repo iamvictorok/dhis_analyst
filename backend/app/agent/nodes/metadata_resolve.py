@@ -2,11 +2,12 @@
 
 Resolution path:
 1. pgvector cosine similarity — when Postgres + pgvector is configured AND embeddings are enabled
-2. SQLite keyword-match — when using SQLite or no embedding provider
-3. In-memory KNOWN_METRICS lookup — deterministic fallback always available
+2. Keyword match against the synced metadata index — works on both SQLite and Postgres
 
-Confidence gate: if top match < metadata_confidence_threshold, surfaces
-disambiguation candidates to the user rather than silently guessing.
+Confidence gate: if the top match is below metadata_confidence_threshold, surfaces
+disambiguation candidates to the user rather than silently guessing. Infrastructure
+failures (index unavailable/unseeded) are distinguished from genuine misses so the
+user is never told a valid indicator "doesn't exist".
 """
 from __future__ import annotations
 
@@ -40,53 +41,84 @@ async def resolve_metadata(state: AgentState, settings: Settings) -> AgentState:
     )
 
     # --- Metric resolution ---
-    # Attempt pgvector resolution for any metric with low confidence
-    low_confidence = [m for m in metrics if m["uid_confidence"] < settings.metadata_confidence_threshold]
+    # Track whether a resolution attempt failed because the metadata index was
+    # unavailable (unseeded table, locked DB, provider down) as opposed to the
+    # index being reachable but holding no match. The two demand opposite
+    # responses: an infra failure must NOT tell the user their indicator is
+    # invalid, while a genuine miss should surface disambiguation candidates.
+    threshold = settings.metadata_confidence_threshold
+    metadata_lookup_failed = False
+    low_confidence = [m for m in metrics if m["uid_confidence"] < threshold]
 
+    # 1. pgvector semantic resolution (Postgres with real embeddings only).
     if low_confidence and settings.is_postgres:
         try:
             metrics = await _pgvector_resolve(metrics, settings)
             state["metrics"] = metrics
-            low_confidence = [m for m in metrics if m["uid_confidence"] < settings.metadata_confidence_threshold]
+            low_confidence = [m for m in metrics if m["uid_confidence"] < threshold]
         except Exception as exc:
             logger.warning("pgvector_resolve_failed", extra={"error": str(exc)})
+            metadata_lookup_failed = True
 
-    # SQLite path: resolve ALL metrics whose UIDs look fabricated or have low confidence
-    if not settings.is_postgres:
-        try:
-            metrics = await _sqlite_resolve_indicators(metrics, settings)
-            state["metrics"] = metrics
-            low_confidence = [m for m in metrics if m["uid_confidence"] < settings.metadata_confidence_threshold]
-        except Exception as exc:
-            logger.warning("sqlite_indicator_resolve_failed", extra={"error": str(exc)})
-
-    # If Postgres isn't used, we skip pgvector but might still check fallback or keywords
+    # 2. Keyword resolution — works on BOTH backends (the query targets the
+    # right table per settings.is_postgres). Previously gated to SQLite, which
+    # dead-ended every Postgres query whenever embeddings were mock/unavailable.
     if low_confidence:
-        # Still low after resolution — surface disambiguation from synced DB
-        query_labels = " ".join(m["label"] for m in low_confidence)
-        candidates = await _keyword_candidates_from_db(query_labels, settings)
-        if candidates:
-            names = ", ".join(f'"{c["label"]}"' for c in candidates[:3])
-            state["clarification_needed"] = True
-            state["clarification_question"] = (
-                f"I found a low-confidence match for your indicator. Did you mean one of: {names}? "
-                f"Please rephrase your question with the exact indicator name."
-            )
-            logger.info(
-                "disambiguation_triggered",
-                extra={"low_confidence_metrics": [m["label"] for m in low_confidence], "candidates": names},
+        try:
+            metrics = await _resolve_indicators_by_keyword(metrics, settings)
+            state["metrics"] = metrics
+            low_confidence = [m for m in metrics if m["uid_confidence"] < threshold]
+        except Exception as exc:
+            logger.warning("keyword_indicator_resolve_failed", extra={"error": str(exc)})
+            metadata_lookup_failed = True
+
+    if low_confidence:
+        labels = [
+            m["label"] for m in low_confidence
+            if isinstance(m.get("label"), str) and m["label"].strip()
+        ]
+        if metadata_lookup_failed:
+            # Infrastructure problem, not a bad query. Proceed with the
+            # unresolved metric; downstream fetch (mock or real) surfaces any
+            # real issue instead of a misleading "indicator doesn't exist" loop.
+            logger.warning(
+                "metadata_index_unavailable_proceeding",
+                extra={"low_confidence_metrics": labels},
             )
         else:
-            state["clarification_needed"] = True
-            missing_labels = ", ".join(m["label"] for m in low_confidence)
-            state["clarification_question"] = (
-                f"I couldn't find any health indicators matching '{missing_labels}' in this DHIS2 instance. "
-                f"Could you verify the indicator name and try again?"
-            )
-            logger.info(
-                "metadata_low_confidence_no_candidates",
-                extra={"low_confidence_metrics": [m["label"] for m in low_confidence]},
-            )
+            # Genuine low/no-confidence match — query candidates PER label so a
+            # multi-indicator request doesn't collapse into one junk LIKE.
+            candidates: list[dict] = []
+            for label in labels:
+                candidates.extend(await _keyword_candidates_from_db(label, settings))
+            if candidates:
+                seen: set[str] = set()
+                unique_names = []
+                for c in candidates:
+                    if c["label"] not in seen:
+                        seen.add(c["label"])
+                        unique_names.append(c["label"])
+                names = ", ".join(f'"{n}"' for n in unique_names[:3])
+                state["clarification_needed"] = True
+                state["clarification_question"] = (
+                    f"I found a low-confidence match for your indicator. Did you mean one of: {names}? "
+                    f"Please rephrase your question with the exact indicator name."
+                )
+                logger.info(
+                    "disambiguation_triggered",
+                    extra={"low_confidence_metrics": labels, "candidates": names},
+                )
+            else:
+                state["clarification_needed"] = True
+                missing_labels = ", ".join(labels) or "the requested indicator"
+                state["clarification_question"] = (
+                    f"I couldn't find any health indicators matching '{missing_labels}' in this DHIS2 instance. "
+                    f"Could you verify the indicator name and try again?"
+                )
+                logger.info(
+                    "metadata_low_confidence_no_candidates",
+                    extra={"low_confidence_metrics": labels},
+                )
 
     # --- Org unit resolution ---
     org_unit = state.get("org_unit", {})
@@ -115,11 +147,23 @@ async def resolve_metadata(state: AgentState, settings: Settings) -> AgentState:
                     },
                 )
             else:
+                # Index reachable but no match for an explicitly named location.
+                # Ask the user rather than sending ou:UNRESOLVED to DHIS2 (409)
+                # or silently querying the wrong scope. Metric clarification (if
+                # any) takes precedence — don't overwrite it.
                 logger.warning(
                     "org_unit_not_found",
                     extra={"label": org_label, "using_placeholder": org_uid},
                 )
+                if not state.get("clarification_needed"):
+                    state["clarification_needed"] = True
+                    state["clarification_question"] = (
+                        f"I couldn't find a location named '{org_label}' in this DHIS2 instance. "
+                        f"Could you check the spelling, or try a broader area?"
+                    )
         except Exception as exc:
+            # Infra failure — leave the org unit as-is and let the analytics
+            # builder fall back to USER_ORGUNIT; do not block with a clarification.
             logger.warning("org_unit_resolve_failed", extra={"label": org_label, "error": str(exc)})
 
     duration = time.time() - start_time
@@ -137,6 +181,23 @@ async def resolve_metadata(state: AgentState, settings: Settings) -> AgentState:
 def _looks_like_dhis2_uid(uid: str) -> bool:
     """DHIS2 UIDs are exactly 11 alphanumeric characters."""
     return bool(re.match(r"^[a-zA-Z][a-zA-Z0-9]{10}$", uid))
+
+
+async def _uid_exists(session, uid: str, settings: Settings) -> bool:
+    """Return True if ``uid`` is present in the synced metadata index."""
+    from sqlalchemy import text as sa_text
+
+    table = "metadata_index" if settings.is_postgres else "metadata_index_lite"
+    try:
+        result = await session.execute(
+            sa_text(f"SELECT 1 FROM {table} WHERE uid = :uid LIMIT 1"),
+            {"uid": uid},
+        )
+        return result.fetchone() is not None
+    except Exception as exc:
+        # If we can't check, don't trust the UID — fall through to resolution.
+        logger.warning("uid_existence_check_failed", extra={"uid": uid, "error": str(exc)})
+        return False
 
 
 async def _resolve_org_unit_from_db(label: str, settings: Settings) -> dict | None:
@@ -163,14 +224,17 @@ async def _resolve_org_unit_from_db(label: str, settings: Settings) -> dict | No
     }
 
 
-async def _sqlite_resolve_indicators(
+async def _resolve_indicators_by_keyword(
     metrics: list[dict],
     settings: Settings,
 ) -> list[dict]:
-    """Resolve indicator UIDs via SQLite keyword search.
+    """Resolve indicator UIDs via keyword search against the synced index.
 
-    Replaces LLM-guessed UIDs with real ones from the synced metadata DB.
-    Only resolves metrics whose UIDs look fabricated (not valid DHIS2 UIDs).
+    Works on both SQLite and Postgres (the query targets the right table).
+    Replaces LLM-guessed UIDs with real ones from the index. A UID is only
+    trusted (and DB lookup skipped) when it is confident AND actually present
+    in the index — LLMs hallucinate syntactically valid UIDs, so shape alone is
+    not enough.
     """
     from backend.app.db.metadata_index import search_indicator_by_name
     from backend.app.db.session import get_db_session
@@ -178,10 +242,13 @@ async def _sqlite_resolve_indicators(
     resolved = []
     async with get_db_session() as session:
         for metric in metrics:
-            # Skip if the UID already looks like a real DHIS2 UID AND confidence is high
+            uid = metric.get("uid", "")
+            # Skip resolution only for a high-confidence UID that we can confirm
+            # exists in the index (a real prior DB/pgvector resolution).
             if (
-                _looks_like_dhis2_uid(metric.get("uid", ""))
+                _looks_like_dhis2_uid(uid)
                 and metric.get("uid_confidence", 0) >= settings.metadata_confidence_threshold
+                and await _uid_exists(session, uid, settings)
             ):
                 resolved.append(metric)
                 continue
@@ -248,6 +315,8 @@ async def _pgvector_resolve(
                 sa_text("""
                 SELECT uid, name, object_type, 1 - (embedding <=> CAST(:emb AS vector)) AS similarity
                 FROM metadata_index
+                WHERE embedding IS NOT NULL
+                  AND object_type IN ('indicator', 'dataElement', 'programIndicator')
                 ORDER BY embedding <=> CAST(:emb AS vector)
                 LIMIT 3
                 """),

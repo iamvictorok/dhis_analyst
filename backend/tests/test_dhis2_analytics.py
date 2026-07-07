@@ -39,7 +39,35 @@ def test_build_analytics_params_uses_user_org_unit_for_unresolved_national():
     assert "ou:USER_ORGUNIT" in params["dimension"]
 
 
-def test_normalise_analytics_response_preserves_rows_and_headers():
+def test_normalise_analytics_response_reorders_to_canonical_layout():
+    # Real DHIS2 returns columns in requested-dimension order (dx, ou, pe) with
+    # the value last. Normalisation must reorder into [org, period, value, metric]
+    # so the renderers (which assume the mock layout) compute correct numbers.
+    raw = {
+        "headers": [
+            {"name": "dx", "column": "Data"},
+            {"name": "ou", "column": "Organisation unit"},
+            {"name": "pe", "column": "Period"},
+            {"name": "value", "column": "Value"},
+        ],
+        "rows": [
+            ["ANC 1st visit", "Bo", "2025Q1", "1200"],
+            ["ANC 1st visit", "Bo", "2025Q2", "1350"],
+        ],
+        "metaData": {"items": {}},
+    }
+
+    result = normalise_analytics_response(raw, {"dimension": []})
+
+    assert result["headers"] == ["Organisation unit", "Period", "Value", "Metric"]
+    assert result["rows"] == [
+        ["Bo", "2025Q1", "1200", "ANC 1st visit"],
+        ["Bo", "2025Q2", "1350", "ANC 1st visit"],
+    ]
+    assert result["metadata"]["data_source"] == "analytics_api"
+
+
+def test_normalise_analytics_response_handles_missing_period_column():
     raw = {
         "headers": [{"column": "dx"}, {"column": "ou"}, {"column": "value"}],
         "rows": [["ANC 1st visit", "Bo", "12"]],
@@ -48,6 +76,31 @@ def test_normalise_analytics_response_preserves_rows_and_headers():
 
     result = normalise_analytics_response(raw, {"dimension": []})
 
-    assert result["headers"] == ["dx", "ou", "value"]
-    assert result["rows"] == [["ANC 1st visit", "Bo", "12"]]
-    assert result["metadata"]["data_source"] == "analytics_api"
+    # dx->metric, ou->org, value->value, no period column present
+    assert result["rows"] == [["Bo", "", "12", "ANC 1st visit"]]
+
+
+def test_build_analytics_params_drops_invalid_disaggregation_tokens():
+    params = build_analytics_params(_state(disaggregations=["sex", "age"]))
+    # Free-text tokens are not valid category-option-combo UIDs and must not be
+    # sent as a co: dimension (DHIS2 would 409).
+    assert not any(d.startswith("co:") for d in params["dimension"])
+
+
+def test_build_analytics_params_national_children_uses_user_orgunit_level():
+    params = build_analytics_params(
+        _state(
+            org_unit={"label": "National", "uid": "UNRESOLVED", "level": 1},
+            disaggregations=["ou_children"],
+        )
+    )
+    assert "ou:USER_ORGUNIT;LEVEL-2" in params["dimension"]
+
+
+def test_build_analytics_params_unresolved_named_org_falls_back_to_user_orgunit():
+    params = build_analytics_params(
+        _state(org_unit={"label": "Bojo District", "uid": "UNRESOLVED", "level": 3})
+    )
+    # A named-but-unresolved org unit must never be sent as ou:UNRESOLVED.
+    assert "ou:USER_ORGUNIT" in params["dimension"]
+    assert not any("UNRESOLVED" in d for d in params["dimension"])

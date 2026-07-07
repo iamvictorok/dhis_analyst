@@ -8,8 +8,15 @@ from typing import Literal
 
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
+# Anchor the .env file to the repository root so settings resolve identically
+# regardless of the process working directory (systemd units, tests run from
+# subdirs, etc.) instead of a CWD-relative lookup that silently falls back to
+# defaults.
+_ENV_FILE = str(Path(__file__).resolve().parent.parent / ".env")
+
+
 class SettingsBase(BaseSettings):
-    model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8", extra="ignore")
+    model_config = SettingsConfigDict(env_file=_ENV_FILE, env_file_encoding="utf-8", extra="ignore")
 
 logger = logging.getLogger("dhis2_analyst.config")
 
@@ -21,7 +28,11 @@ class Settings(SettingsBase):
     dhis2_service_account_user: str = ""
     dhis2_service_account_pass: str = ""
 
-    llm_provider: str        # openai | anthropic | ollama | azure | cohere | gemini
+    # mock | openai | anthropic | ollama | azure | cohere | gemini.
+    # Defaults to "mock" so the app boots without external credentials (and so
+    # importing the app never raises a bare ValidationError before the friendly
+    # startup checks can run).
+    llm_provider: str = "mock"
     llm_model: str = "gpt-4o"           # model string passed to LiteLLM
     llm_api_key: str = ""
     llm_base_url: str = ""              # for Ollama: http://localhost:11434
@@ -54,6 +65,9 @@ class Settings(SettingsBase):
 
     # Rate limiting
     rate_limit_rpm: int = 60            # requests per minute per user/IP
+    # Trust X-Forwarded-For for the client IP (enable ONLY behind a proxy you
+    # control — clients can otherwise spoof the header to dodge rate limits).
+    trust_proxy_headers: bool = False
 
     # CORS — include both Vite dev port and direct backend port
     cors_origins: str = "http://localhost:5173,http://127.0.0.1:5173,http://127.0.0.1:8000,http://localhost:8000"
@@ -90,7 +104,20 @@ class Settings(SettingsBase):
 
 
     def startup_checks(self) -> None:
-        """Hard-fail on insecure or incomplete configuration."""
+        """Hard-fail on insecure or incomplete configuration.
+
+        The ``mock`` provider is exempt: it runs entirely locally (deterministic
+        classifier + canned generation) so it needs neither LLM credentials nor
+        a production JWT secret, which is what makes the shipped ``.env.example``
+        runnable out of the box.
+        """
+        if self.llm_provider == "mock":
+            logger.warning(
+                "llm_provider=mock — running with the deterministic local "
+                "classifier and canned generation. Set a real LLM_PROVIDER for production."
+            )
+            return
+
         if not self.llm_api_key and not self.llm_base_url:
             logger.critical(
                 "FATAL: No LLM credentials configured. "

@@ -14,6 +14,30 @@ export async function readSseStream(response, onEvent) {
   const decoder = new TextDecoder();
   let buffer = '';
 
+  // Parser state MUST persist across reads. An SSE block spans multiple lines
+  // (`event:`, `data:`, blank); network/proxy chunking can split a block across
+  // two reader.read() calls. Declaring these inside the loop reset them on every
+  // chunk, silently dropping any event whose block crossed a read boundary —
+  // large payloads (reports, charts) failed intermittently for exactly this.
+  let currentEvent = '';
+  const dataLines = [];
+
+  const dispatch = () => {
+    if (!currentEvent && dataLines.length === 0) return false;
+    const rawData = dataLines.join('\n');
+    let payload = rawData;
+    try {
+      payload = JSON.parse(rawData);
+    } catch {
+      payload = rawData;
+    }
+    onEvent(currentEvent, payload);
+    const wasDone = currentEvent === 'done';
+    currentEvent = '';
+    dataLines.length = 0;
+    return wasDone;
+  };
+
   while (true) {
     const { value, done } = await reader.read();
     if (done) break;
@@ -22,31 +46,26 @@ export async function readSseStream(response, onEvent) {
     const lines = buffer.split('\n');
     buffer = lines.pop() || '';
 
-    let currentEvent = '';
-    let currentData = '';
-
-    for (const line of lines) {
-      if (line.startsWith('event: ')) {
-        currentEvent = line.slice(7).trim();
-      } else if (line.startsWith('data: ')) {
-        currentData = line.slice(6);
-      } else if (line === '' && currentEvent) {
-        // End of SSE block — dispatch
-        try {
-          const parsed = JSON.parse(currentData);
-          onEvent(currentEvent, parsed);
-        } catch {
-          onEvent(currentEvent, currentData);
-        }
-
-        if (currentEvent === 'done') {
+    for (const rawLine of lines) {
+      const line = rawLine.endsWith('\r') ? rawLine.slice(0, -1) : rawLine;
+      if (line.startsWith('event:')) {
+        currentEvent = line.slice(6).trim();
+      } else if (line.startsWith('data:')) {
+        // Per the SSE spec, accumulate multiple data: lines (one leading space
+        // after the colon is stripped) instead of overwriting.
+        dataLines.push(line.slice(5).replace(/^ /, ''));
+      } else if (line === '') {
+        // Blank line terminates the current SSE block.
+        if (dispatch()) {
           reader.cancel();
           return;
         }
-
-        currentEvent = '';
-        currentData = '';
       }
     }
+  }
+
+  // Flush any trailing block that arrived without a final blank line.
+  if (dispatch()) {
+    reader.cancel();
   }
 }

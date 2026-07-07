@@ -58,16 +58,25 @@ def slides_to_pptx(
         slide.shapes.title.text = str(item.get("title", "Insight"))
         _style_text(slide.shapes.title, size=28, bold=True, color=RGBColor(0xF8, 0xFA, 0xFC))
 
-        # Body content
-        if len(slide.placeholders) > 1:
+        # Chart slides carry an x/y/labels "data" block — render it as a native
+        # chart. Only fall back to text if the data is missing/malformed (so the
+        # numbers are never silently dropped, as they were before).
+        chart_added = False
+        if slide_type == "chart":
+            chart_added = _add_native_chart(slide, item.get("data"), prs)
+
+        # Body content (skipped when a native chart filled the slide)
+        if not chart_added and len(slide.placeholders) > 1:
             body = slide.placeholders[1].text_frame
             body.clear()
 
             content = item.get("content", "")
-            if isinstance(content, list):
+            if slide_type == "chart":
+                content = _chart_data_as_text(item.get("data")) or _dict_title(content)
+            elif isinstance(content, list):
                 content = "\n".join(str(x) for x in content)
             elif isinstance(content, dict):
-                content = str(content.get("title", ""))
+                content = _dict_title(content)
 
             for line in str(content).split("\n"):
                 p = body.add_paragraph()
@@ -84,6 +93,52 @@ def slides_to_pptx(
     data = out.getvalue()
     logger.info("pptx_generate_ok", extra={"size_bytes": len(data), "slide_count": len(prs.slides)})
     return data
+
+
+def _add_native_chart(slide, data: Any, prs: Presentation) -> bool:
+    """Add a clustered-column chart from an x/y data block. Returns success."""
+    if not isinstance(data, dict):
+        return False
+    xs = data.get("x") or []
+    ys = data.get("y") or []
+    if not xs or not ys or len(xs) != len(ys):
+        return False
+    try:
+        y_values = [float(v) for v in ys]
+    except (TypeError, ValueError):
+        return False
+
+    try:
+        from pptx.chart.data import CategoryChartData
+        from pptx.enum.chart import XL_CHART_TYPE
+
+        chart_data = CategoryChartData()
+        chart_data.categories = [str(x) for x in xs]
+        chart_data.add_series("Value", y_values)
+        slide.shapes.add_chart(
+            XL_CHART_TYPE.COLUMN_CLUSTERED,
+            Inches(1), Inches(1.7), Inches(11.3), Inches(4.8),
+            chart_data,
+        )
+        return True
+    except Exception as exc:  # pragma: no cover - defensive
+        logger.warning("pptx_chart_render_failed", extra={"error": str(exc)})
+        return False
+
+
+def _chart_data_as_text(data: Any) -> str:
+    """Fallback textual rendering of chart data so numbers aren't lost."""
+    if not isinstance(data, dict):
+        return ""
+    xs = data.get("x") or []
+    ys = data.get("y") or []
+    return "\n".join(f"{x}: {y}" for x, y in zip(xs, ys))[:1000]
+
+
+def _dict_title(content: Any) -> str:
+    if isinstance(content, dict):
+        return str(content.get("title", ""))
+    return str(content)
 
 
 def _style_text(shape, size: int = 14, bold: bool = False, color=None) -> None:

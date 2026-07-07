@@ -71,6 +71,7 @@ async def build_initial_state(
     settings: Settings,
     identity: Identity,
     history: list[dict] | None = None,
+    dhis2_token: str | None = None,
 ) -> AgentState:
     """Classify intent (LLM-assisted when real provider is configured)."""
     intent = await classify_intent_llm(
@@ -111,6 +112,7 @@ async def build_initial_state(
         "generated_file_id": None,
         "active_conversational_response": None,
         "fetch_error": None,
+        "_dhis2_token": dhis2_token,
     }
 
 
@@ -119,6 +121,7 @@ async def run_agent_stream(
     settings: Settings,
     identity: Identity | None = None,
     history: list[dict] | None = None,
+    dhis2_token: str | None = None,
 ) -> AsyncIterator[str]:
     """Main agent pipeline — yields SSE-formatted strings."""
     if identity is None:
@@ -136,7 +139,7 @@ async def run_agent_stream(
     pipeline_start = time.monotonic()
 
     try:
-        state = await build_initial_state(request, settings, identity, history)
+        state = await build_initial_state(request, settings, identity, history, dhis2_token)
     except Exception as exc:
         logger.error("intent_classification_failed", extra={"error": str(exc)}, exc_info=True)
         error_str = str(exc).lower()
@@ -265,9 +268,18 @@ async def run_agent_stream(
     mode = state["output_mode"]
 
     if mode == "dashboard":
-        for chart in state["active_chart_configs"]:
-            yield sse("chart_config", chart)
-            await asyncio.sleep(0)
+        charts = state["active_chart_configs"]
+        if charts:
+            for chart in charts:
+                yield sse("chart_config", chart)
+                await asyncio.sleep(0)
+        else:
+            # Data was retrieved but no chart could be built — don't end the
+            # stream silently with just 'done' (blank assistant bubble).
+            yield sse("token", {
+                "text": "I retrieved the data but couldn't build a chart from it. "
+                        "Try rephrasing your request or asking for a table or report.",
+            })
     elif mode in ("report", "map"):
         yield sse("report_html", {"html": state["active_report_html"]})
     elif mode == "presentation":

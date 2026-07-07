@@ -19,6 +19,7 @@ marked.use({ gfm: true, breaks: true });
 import { getAuth, isAuthenticated, clearAuth } from './auth/standaloneAuth.js';
 import { detectDhis2 } from './auth/dhis2Auth.js';
 import { readSseStream } from './lib/stream.js';
+import { sanitizeHtml } from './lib/sanitize.js';
 import Dashboard from './components/Dashboard.jsx';
 import ReportEditor from './components/ReportEditor.jsx';
 import DownloadBar from './components/DownloadBar.jsx';
@@ -39,9 +40,19 @@ function authHeaders() {
   return h;
 }
 
+// Registered by the App so any API helper can force a return to the login
+// screen when the session token has expired (backend JWTs are short-lived).
+let onSessionExpired = null;
+
+function handleAuthFailure(status) {
+  if (status === 401 && typeof onSessionExpired === 'function') {
+    onSessionExpired();
+  }
+}
+
 async function apiGet(path) {
   const res = await fetch(path, { headers: authHeaders() });
-  if (!res.ok) throw new Error(`${res.status}`);
+  if (!res.ok) { handleAuthFailure(res.status); throw new Error(`${res.status}`); }
   return res.json();
 }
 
@@ -51,13 +62,13 @@ async function apiPost(path, body = {}) {
     headers: authHeaders(),
     body: JSON.stringify(body),
   });
-  if (!res.ok) throw new Error(`${res.status}`);
+  if (!res.ok) { handleAuthFailure(res.status); throw new Error(`${res.status}`); }
   return res.json();
 }
 
 async function apiDelete(path) {
   const res = await fetch(path, { method: 'DELETE', headers: authHeaders() });
-  if (!res.ok) throw new Error(`${res.status}`);
+  if (!res.ok) { handleAuthFailure(res.status); throw new Error(`${res.status}`); }
   return res.json();
 }
 
@@ -67,7 +78,7 @@ async function apiPatch(path, body) {
     headers: authHeaders(),
     body: JSON.stringify(body),
   });
-  if (!res.ok) throw new Error(`${res.status}`);
+  if (!res.ok) { handleAuthFailure(res.status); throw new Error(`${res.status}`); }
   return res.json();
 }
 
@@ -96,6 +107,9 @@ function App() {
   const [sidebarOpen, setSidebarOpen] = useState(false);
 
   const threadRef = useRef(null);
+  // Aborts the in-flight chat stream when the user navigates away mid-response,
+  // so its events can't leak into (and persist onto) another conversation.
+  const abortRef = useRef(null);
 
   useEffect(() => {
     setIsDhis2(detectDhis2());
@@ -111,6 +125,20 @@ function App() {
     }
   }, [authed]);
 
+  // Return to the login screen when any API call reports an expired session,
+  // instead of leaving the app "authenticated" while every request 401s.
+  useEffect(() => {
+    onSessionExpired = () => {
+      clearAuth();
+      setAuthed(false);
+      setConversations([]);
+      setActiveConvId(null);
+      setMessages([]);
+      setClarification(null);
+    };
+    return () => { onSessionExpired = null; };
+  }, []);
+
   const scrollToBottom = useCallback(() => {
     if (threadRef.current) {
       threadRef.current.scrollTop = threadRef.current.scrollHeight;
@@ -122,6 +150,7 @@ function App() {
   // ---------------------------------------------------------------------------
 
   const handleNewChat = useCallback(async () => {
+    abortRef.current?.abort();
     try {
       const conv = await apiPost('/api/conversations');
       setConversations(prev => [conv, ...prev]);
@@ -140,6 +169,7 @@ function App() {
       setSidebarOpen(false);
       return;
     }
+    abortRef.current?.abort();
     setActiveConvId(id);
     setClarification(null);
     streamArtefacts.current = { charts: [], reportHtml: '', slides: [], evidence: [], exportData: null };
@@ -155,6 +185,7 @@ function App() {
   }, [activeConvId, scrollToBottom]);
 
   const handleDeleteConv = useCallback(async (id) => {
+    if (id === activeConvId) abortRef.current?.abort();
     try {
       await apiDelete(`/api/conversations/${id}`);
       setConversations(prev => prev.filter(c => c.id !== id));
@@ -175,6 +206,11 @@ function App() {
     if (!text.trim() || loading) return;
     setClarification(null);
     setLoading(true);
+
+    // Abort any previous stream and track this one so navigation can cancel it.
+    abortRef.current?.abort();
+    const controller = new AbortController();
+    abortRef.current = controller;
 
     // Reset stream artefacts
     streamArtefacts.current = { charts: [], reportHtml: '', slides: [], evidence: [], exportData: null };
@@ -221,6 +257,7 @@ function App() {
       const res = await fetch('/api/chat', {
         method: 'POST',
         headers: authHeaders(),
+        signal: controller.signal,
         body: JSON.stringify({
           message: text,
           conversation_id: convId,
@@ -229,6 +266,10 @@ function App() {
         }),
       });
 
+      if (res.status === 401) {
+        handleAuthFailure(401);
+        throw new Error('Your session expired. Please log in again.');
+      }
       if (!res.ok || !res.body) throw new Error(`Request failed: ${res.status}`);
 
       await readSseStream(res, (type, data) => {
@@ -318,9 +359,21 @@ function App() {
               return updated;
             });
             break;
-          case 'clarification':
-            setClarification(data.question || '');
+          case 'clarification': {
+            const question = data.question || 'Could you clarify your request?';
+            setClarification(question);
+            // Surface the question as the assistant turn so the bubble isn't
+            // empty and the question is persisted as context for the reply.
+            setMessages(prev => {
+              const updated = [...prev];
+              const last = updated[updated.length - 1];
+              if (last?.role === 'assistant') {
+                updated[updated.length - 1] = { ...last, content: question };
+              }
+              return updated;
+            });
             break;
+          }
           case 'error':
             setMessages(prev => {
               const updated = [...prev];
@@ -334,41 +387,56 @@ function App() {
         }
       });
     } catch (err) {
-      setMessages(prev => {
-        const updated = [...prev];
-        const last = updated[updated.length - 1];
-        if (last?.role === 'assistant') {
-          updated[updated.length - 1] = { ...last, content: err.message };
-        }
-        return updated;
-      });
+      // A deliberate abort (conversation switch) is not an error to surface.
+      if (err.name !== 'AbortError' && !controller.signal.aborted) {
+        setMessages(prev => {
+          const updated = [...prev];
+          const last = updated[updated.length - 1];
+          if (last?.role === 'assistant') {
+            updated[updated.length - 1] = { ...last, content: err.message };
+          }
+          return updated;
+        });
+      }
     }
 
-    // Persist assistant message to backend (with artefacts)
-    try {
-      setMessages(prev => {
-        const last = prev[prev.length - 1];
-        if (last?.role === 'assistant') {
-          apiPost(`/api/conversations/${convId}/messages`, {
-            role: 'assistant',
-            content: last.content || '',
-            artefacts: streamArtefacts.current,
-          }).catch(() => {});
+    // Persist + reorder only when this stream wasn't cancelled mid-flight. On an
+    // abort the user has already navigated away; touching state/history here
+    // would corrupt (and cross-persist into) the wrong conversation.
+    if (!controller.signal.aborted) {
+      // Persist assistant message to backend (with artefacts). Skip a completely
+      // empty turn — persisting one poisons the history the intent classifier
+      // replays on the next question.
+      try {
+        setMessages(prev => {
+          const last = prev[prev.length - 1];
+          const a = streamArtefacts.current;
+          const hasArtefacts = a.charts.length || a.reportHtml || a.slides.length || a.evidence.length || a.exportData;
+          if (last?.role === 'assistant' && (last.content || hasArtefacts)) {
+            apiPost(`/api/conversations/${convId}/messages`, {
+              role: 'assistant',
+              content: last.content || '',
+              artefacts: a,
+            }).catch(() => {});
+          }
+          return prev;
+        });
+      } catch { /* non-critical */ }
+
+      // Move conversation to top of list
+      setConversations(prev => {
+        const idx = prev.findIndex(c => c.id === convId);
+        if (idx > 0) {
+          const conv = prev[idx];
+          return [{ ...conv, updated_at: new Date().toISOString() }, ...prev.filter(c => c.id !== convId)];
         }
         return prev;
       });
-    } catch { /* non-critical */ }
+    }
 
-    // Move conversation to top of list
-    setConversations(prev => {
-      const idx = prev.findIndex(c => c.id === convId);
-      if (idx > 0) {
-        const conv = prev[idx];
-        return [{ ...conv, updated_at: new Date().toISOString() }, ...prev.filter(c => c.id !== convId)];
-      }
-      return prev;
-    });
-
+    if (abortRef.current === controller) {
+      abortRef.current = null;
+    }
     setLoading(false);
   }, [loading, mode, activeConvId, messages.length, scrollToBottom]);
 
@@ -493,7 +561,7 @@ function MessageBlock({ msg, isLast, isLoading }) {
 
       <div class="message-bubble">
         {msg.content ? (
-          <div dangerouslySetInnerHTML={{ __html: marked.parse(msg.content) }} />
+          <div dangerouslySetInnerHTML={{ __html: sanitizeHtml(marked.parse(msg.content)) }} />
         ) : (isLoading ? (
           <span class="typing-indicator">
             <span class="typing-dot" />
@@ -652,13 +720,14 @@ function Composer({ loading, mode, onModeChange, onSend }) {
 
   const handleSubmit = (e) => {
     e.preventDefault();
-    if (text.trim()) {
-      onSend(text);
-      setText('');
-      // Reset textarea height
-      if (textareaRef.current) {
-        textareaRef.current.style.height = 'auto';
-      }
+    // Do not clear the input while a response is streaming — handleSend rejects
+    // the send when loading, so clearing here would silently discard the text.
+    if (loading || !text.trim()) return;
+    onSend(text);
+    setText('');
+    // Reset textarea height
+    if (textareaRef.current) {
+      textareaRef.current.style.height = 'auto';
     }
   };
 

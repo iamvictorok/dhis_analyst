@@ -32,13 +32,23 @@ def render_presentation(state: AgentState) -> list[dict]:
         }
     )
 
-    values = []
+    # Parse rows once into aligned (org, period, value) triples, skipping any
+    # row whose value cell isn't numeric (empty no-data cells, or a mis-shaped
+    # row). This keeps x/y/labels the same length and avoids an unguarded
+    # float() crashing the whole request after data was fetched.
+    parsed_rows: list[tuple[str, str, float]] = []
     for row in rows:
+        if len(row) <= 2:
+            continue
         try:
-            if len(row) > 2:
-                values.append(float(row[2]))
+            value = float(row[2])
         except (ValueError, TypeError):
-            pass
+            continue
+        org_cell = str(row[0]) if len(row) > 0 else ""
+        period_cell = str(row[1]) if len(row) > 1 else ""
+        parsed_rows.append((org_cell, period_cell, value))
+
+    values = [v for _, _, v in parsed_rows]
 
     slides: list[dict] = []
 
@@ -64,16 +74,17 @@ def render_presentation(state: AgentState) -> list[dict]:
         "content": summary,
     })
 
-    # Slide 3: Chart
+    # Slide 3: Chart — x/y/labels drawn from the same parsed rows so they stay
+    # aligned and never contain an unparseable value.
     chart_configs = state.get("active_chart_configs", [])
     slides.append({
         "type": "chart",
         "title": f"{metric} Trend",
         "content": chart_configs[0] if chart_configs else {},
         "data": {
-            "x": [str(r[1]) for r in rows if len(r) > 1],
-            "y": [float(r[2]) for r in rows if len(r) > 2],
-            "labels": [str(r[0]) for r in rows if len(r) > 0],
+            "x": [period for _, period, _ in parsed_rows],
+            "y": [value for _, _, value in parsed_rows],
+            "labels": [org for org, _, _ in parsed_rows],
         },
     })
 

@@ -15,7 +15,13 @@ from typing import Any, Literal
 
 logger = logging.getLogger("dhis2_analyst.intent")
 
-OutputMode = Literal["conversational", "dashboard", "report", "presentation", "export"]
+OutputMode = Literal["conversational", "dashboard", "report", "presentation", "export", "map"]
+
+# Every mode the pipeline can actually render. Any LLM-proposed value outside
+# this set is coerced to "conversational" rather than trusted blindly.
+VALID_OUTPUT_MODES: frozenset[str] = frozenset(
+    {"conversational", "dashboard", "report", "presentation", "export", "map"}
+)
 
 PERIOD_RE = re.compile(r"\b(20\d{2})(?:\s*[-/]?\s*(q[1-4]))?\b", re.I)
 
@@ -29,6 +35,23 @@ ORG_UNIT_LEVEL_RE = re.compile(
 # Extract a location name from patterns like "in Bo district", "for Kaduna state"
 _ORG_UNIT_NL_RE = re.compile(
     r"(?:\b(?:in|for|at|from|of|across)\b\s+(?:the\s+)?)([A-Z][a-zA-Z\-']+(?:\s+[A-Z][a-zA-Z\-']+)*)",
+)
+
+# Words that look like capitalised place names after a preposition but are not
+# (months, common metric acronyms) — filtered out of fallback org-unit extraction.
+_ORG_UNIT_STOPWORDS: frozenset[str] = frozenset({
+    "january", "february", "march", "april", "may", "june", "july",
+    "august", "september", "october", "november", "december",
+    "bcg", "opv", "anc", "who", "hiv", "tb", "art", "pmtct", "penta",
+    "monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday",
+})
+
+# Noise phrases stripped (word-boundary only) when isolating the health topic.
+_METRIC_NOISE_RE = re.compile(
+    r"\b(?:show me|give me|what is|what are|how many|table of|trend of|"
+    r"compare|last|this|over the|in the|for the|month|year|quarter|week|"
+    r"district|state|national)\b",
+    re.I,
 )
 
 # ---------------------------------------------------------------------------
@@ -164,6 +187,10 @@ async def classify_intent_llm(
 
     now = today or date.today()
 
+    # Mock provider: use the deterministic classifier directly (no network call).
+    if getattr(settings, "llm_provider", "") == "mock":
+        return classify_intent(message, forced_mode=forced_mode, today=now)
+
     relative_period_list = ", ".join(sorted(DHIS2_RELATIVE_PERIODS))
     system = f"""You are an intent classifier for a DHIS2 public health analytics system.
 Today is {now.isoformat()}. Analyse the user query and return ONLY a JSON object.
@@ -255,8 +282,12 @@ Web enrichment: true for WHO guidelines, benchmarks, outbreak context, policy, e
             parsed = parsed[0]
         else:
             return classify_intent(message, forced_mode=forced_mode, today=now)
-            
-    return _merge_llm_intent(parsed, forced_mode, now)
+
+    if not isinstance(parsed, dict):
+        logger.warning("llm_intent_non_object", extra={"type": type(parsed).__name__})
+        return classify_intent(message, forced_mode=forced_mode, today=now)
+
+    return _merge_llm_intent(parsed, forced_mode, now, message)
 
 
 
@@ -282,13 +313,10 @@ def _extract_metric_labels(text: str) -> list[dict[str, Any]]:
     No hardcoded UIDs — returns UNRESOLVED markers for the metadata resolver
     to look up from whichever DHIS2 instance is connected.
     """
-    # Strip temporal/location noise to isolate the health topic
-    cleaned = text
-    for noise in ("show me", "give me", "what is", "what are", "how many",
-                  "table of", "trend of", "compare", "last", "this",
-                  "over the", "in the", "for the", "month", "year",
-                  "quarter", "week", "district", "state", "national"):
-        cleaned = cleaned.replace(noise, " ")
+    # Strip temporal/location noise to isolate the health topic. Word-boundary
+    # matching only — a plain str.replace would gut real words (e.g. "state"
+    # inside "prostate", "this" inside "arthritis").
+    cleaned = _METRIC_NOISE_RE.sub(" ", text)
     cleaned = re.sub(r"\s+", " ", cleaned).strip()
 
     if not cleaned:
@@ -308,16 +336,30 @@ def _extract_org_unit(text: str) -> dict[str, Any]:
     Uses generic preposition patterns (in/for/at X) — no hardcoded place names.
     The metadata resolver will look up the real UID from the synced DHIS2 DB.
     """
-    # Try "in <Place>" / "for <Place>" pattern
-    match = _ORG_UNIT_NL_RE.search(text)
-    if match:
-        label = match.group(1).strip()
-        # Strip trailing level keywords like "district", "state"
-        label = ORG_UNIT_LEVEL_RE.sub("", label).strip() or label
-        if label.lower() not in {"the", "a", "an", "this", "that", "last", "next"}:
-            # Infer level from context
-            level = _infer_org_level(text)
-            return {"label": label, "uid": "UNRESOLVED", "level": level}
+    # Try "in <Place>" / "for <Place>" patterns. Iterate all matches and prefer
+    # a candidate adjacent to an org-level keyword ("Bo district"); skip months
+    # and metric acronyms that also capitalise after a preposition.
+    skip = {"the", "a", "an", "this", "that", "last", "next"} | _ORG_UNIT_STOPWORDS
+    fallback_label: str | None = None
+    for match in _ORG_UNIT_NL_RE.finditer(text):
+        raw = match.group(1).strip()
+        # Strip any level keyword captured inside the run, and also look just
+        # past the match for a trailing one ("Bo district" — the regex captures
+        # only "Bo", so the keyword sits after match.end()).
+        following = text[match.end(): match.end() + 20]
+        had_level_kw = bool(ORG_UNIT_LEVEL_RE.search(raw)) or bool(
+            re.match(r"\s+" + ORG_UNIT_LEVEL_RE.pattern, following, re.I)
+        )
+        label = ORG_UNIT_LEVEL_RE.sub("", raw).strip() or raw
+        if not label or label.lower() in skip:
+            continue
+        if had_level_kw:
+            # Strong signal ("... in Bo district") — take it immediately.
+            return {"label": label, "uid": "UNRESOLVED", "level": _infer_org_level(text)}
+        if fallback_label is None:
+            fallback_label = label
+    if fallback_label is not None:
+        return {"label": fallback_label, "uid": "UNRESOLVED", "level": _infer_org_level(text)}
 
     # Check for bare level keywords
     level_match = ORG_UNIT_LEVEL_RE.search(text.lower())
@@ -372,26 +414,39 @@ def _detect_periods(text: str, today: date) -> list[str]:
                 continue
             periods.append(code)
 
-    # 2. Extract explicit year/quarter codes like "2024", "2024Q1"
+    # 2. Extract explicit year/quarter codes like "2024", "2024Q1". A bare
+    # four-digit token is only treated as a year within a plausible reporting
+    # window — otherwise quantities ("over 2000 cases") and far-future targets
+    # ("2050 goal") get misread as periods.
     for year, quarter in PERIOD_RE.findall(text):
-        periods.append(f"{year}{quarter.upper()}" if quarter else year)
+        if quarter:
+            periods.append(f"{year}{quarter.upper()}")
+        elif 2010 <= int(year) <= today.year + 1:
+            periods.append(year)
 
     # 3. Legacy handlers for phrases not yet covered above
     if not periods:
         if "year to date" in text or "ytd" in text:
             periods.append(str(today.year))
         if "last three quarters" in text or "last 3 quarters" in text:
-            periods.append("LAST_4_QUARTERS")
+            # DHIS2 has no LAST_3_QUARTERS code — emit the three explicit
+            # quarter codes rather than silently widening to four.
+            periods.extend(_last_n_quarter_codes(today, 3))
 
     return sorted(set(periods)) or ["THIS_YEAR"]
 
 
+# Word-boundary matching — a substring test flags "who" inside "whooping",
+# "target" inside "targeted", "standard" inside "standardized", etc.
+_WEB_ENRICHMENT_RE = re.compile(
+    r"\b(?:who|guidelines?|benchmarks?|outbreaks?|policy|targets?|compare|"
+    r"global|international|standards?|unicef|cdc|external|context|news|recent)\b",
+    re.I,
+)
+
+
 def _needs_web_enrichment(text: str) -> bool:
-    return any(w in text for w in (
-        "who", "guideline", "benchmark", "outbreak", "policy", "target",
-        "compare", "national target", "global", "international", "standard",
-        "unicef", "cdc", "external", "context", "news", "recent",
-    ))
+    return bool(_WEB_ENRICHMENT_RE.search(text))
 
 
 def _detect_viz_types(text: str, mode: OutputMode) -> list[str]:
@@ -427,33 +482,50 @@ def _last_month_code(today: date) -> str:
     return f"{today.year}{today.month - 1:02d}"
 
 
-def _merge_llm_intent(parsed: dict, forced_mode: OutputMode | None, today: date) -> dict[str, Any]:
-    """Normalise LLM JSON output into the internal intent schema."""
-    metrics = parsed.get("metrics") or []
-    if not metrics:
-        metrics = [{
-            "label": "Health Service Coverage Rate",
-            "uid": "UNRESOLVED",
-            "uid_confidence": 0.40,
-            "object_type": "indicator",
-        }]
-    else:
-        for m in metrics:
-            # LLM now outputs uid=null — mark as needing resolution
-            if not m.get("uid") or m["uid"] == "null":
-                m["uid"] = "UNRESOLVED"
-                m["uid_confidence"] = 0.40
-            else:
-                m.setdefault("uid_confidence", 0.90)
-            m.setdefault("object_type", "indicator")
+def _last_n_quarter_codes(today: date, n: int) -> list[str]:
+    """Return the ``n`` most recent completed quarter codes, oldest first."""
+    q = ((today.month - 1) // 3) or 4
+    yr = today.year if q != 4 else today.year - 1
+    codes: list[str] = []
+    for _ in range(n):
+        codes.append(f"{yr}Q{q}")
+        q -= 1
+        if q == 0:
+            q = 4
+            yr -= 1
+    return list(reversed(codes))
 
-    org_label = parsed.get("org_unit_label", "National")
 
-    # Validate and normalise periods — accept both fixed and relative codes
-    raw_periods = parsed.get("periods") or []
+def _merge_llm_intent(
+    parsed: dict,
+    forced_mode: OutputMode | None,
+    today: date,
+    message: str = "",
+) -> dict[str, Any]:
+    """Normalise LLM JSON output into the internal intent schema.
+
+    LLM output is untrusted: fields may be null, wrong-typed, nested, or
+    hallucinated. Every field is coerced defensively so a malformed response
+    degrades gracefully instead of raising and aborting the whole request.
+    """
+    metrics = _normalise_llm_metrics(parsed.get("metrics"))
+
+    org_label = _normalise_org_label(parsed.get("org_unit_label"))
+
+    # Validate and normalise periods — accept both fixed and relative codes.
+    # LLMs may emit a bare string, integers (years), or null entries.
+    raw_periods = parsed.get("periods")
+    if isinstance(raw_periods, str):
+        raw_periods = [raw_periods]
+    elif not isinstance(raw_periods, list):
+        raw_periods = []
     valid_periods: list[str] = []
     for p in raw_periods:
-        p_stripped = p.strip()
+        if p is None:
+            continue
+        p_stripped = str(p).strip()
+        if not p_stripped:
+            continue
         if p_stripped in DHIS2_RELATIVE_PERIODS:
             valid_periods.append(p_stripped)
         elif re.match(r"^\d{4}(Q[1-4]|W\d{1,2}|\d{2})?$", p_stripped):
@@ -463,17 +535,99 @@ def _merge_llm_intent(parsed: dict, forced_mode: OutputMode | None, today: date)
     if not valid_periods:
         valid_periods = ["THIS_YEAR"]
 
+    # Whitelist the output mode — never trust an LLM-invented enum value.
+    raw_mode = parsed.get("output_mode")
+    if forced_mode:
+        output_mode = forced_mode
+    elif isinstance(raw_mode, str) and raw_mode in VALID_OUTPUT_MODES:
+        output_mode = raw_mode
+    else:
+        if raw_mode is not None:
+            logger.warning("llm_output_mode_rejected", extra={"output_mode": raw_mode})
+        output_mode = "conversational"
+
+    disaggregations = parsed.get("disaggregations")
+    if not isinstance(disaggregations, list):
+        disaggregations = []
+
+    web_queries = parsed.get("web_search_queries")
+    if not isinstance(web_queries, list):
+        web_queries = []
+
+    strategy = parsed.get("data_retrieval_strategy")
+    if strategy not in {"analytics_api", "tracker_api", "data_value_sets", "direct_sql", "both"}:
+        strategy = "analytics_api"
+
     return {
-        "output_mode": forced_mode or parsed.get("output_mode", "conversational"),
-        "requires_data": parsed.get("requires_data", True),
+        "output_mode": output_mode,
+        "requires_data": bool(parsed.get("requires_data", True)),
         "metrics": metrics,
-        "org_unit": {"label": org_label, "uid": "UNRESOLVED", "level": 1 if org_label.lower() in {"national", "federal"} else 2},
+        "org_unit": {
+            "label": org_label,
+            "uid": "UNRESOLVED",
+            "level": 1 if org_label.lower() in {"national", "federal"} else 2,
+        },
         "periods": valid_periods,
-        "disaggregations": parsed.get("disaggregations") or [],
-        "viz_types": ["bar", "line"],
+        "disaggregations": disaggregations,
+        # Honour the user's requested chart type on the primary path too,
+        # instead of hardcoding bar+line (kept the fallback contract in sync).
+        "viz_types": _detect_viz_types(message.lower(), output_mode),
         "needs_web_enrichment": bool(parsed.get("needs_web_enrichment")),
-        "web_search_queries": parsed.get("web_search_queries") or [],
-        "data_retrieval_strategy": parsed.get("data_retrieval_strategy", "analytics_api"),
+        "web_search_queries": [str(q) for q in web_queries if q],
+        "data_retrieval_strategy": strategy,
         "clarification_needed": bool(parsed.get("clarification_needed")),
         "clarification_question": parsed.get("clarification_question"),
     }
+
+
+def _normalise_llm_metrics(raw: Any) -> list[dict[str, Any]]:
+    """Coerce the LLM ``metrics`` field into a clean list of metric dicts.
+
+    Tolerates a single dict, a list of strings, null/blank labels, and
+    hallucinated UIDs. LLM-supplied UIDs are never trusted on syntax alone —
+    they are marked low-confidence so the metadata resolver verifies them
+    against the synced index.
+    """
+    if isinstance(raw, dict):
+        raw = [raw]
+    if not isinstance(raw, list):
+        raw = []
+
+    metrics: list[dict[str, Any]] = []
+    for m in raw:
+        if isinstance(m, str):
+            m = {"label": m}
+        if not isinstance(m, dict):
+            continue
+        label = m.get("label")
+        if not isinstance(label, str) or not label.strip():
+            continue
+        metric = {
+            "label": label.strip(),
+            "uid": "UNRESOLVED",
+            "uid_confidence": 0.40,
+            "object_type": m.get("object_type") if isinstance(m.get("object_type"), str) else "indicator",
+        }
+        metrics.append(metric)
+
+    if not metrics:
+        metrics = [{
+            "label": "Health Service Coverage Rate",
+            "uid": "UNRESOLVED",
+            "uid_confidence": 0.40,
+            "object_type": "indicator",
+        }]
+    return metrics
+
+
+def _normalise_org_label(raw: Any) -> str:
+    """Coerce the LLM ``org_unit_label`` into a plain string.
+
+    The LLM may emit null (no location), a nested object, or a non-string;
+    any of these previously crashed ``.lower()`` and aborted the request.
+    """
+    if isinstance(raw, dict):
+        raw = raw.get("label")
+    if not isinstance(raw, str) or not raw.strip():
+        return "National"
+    return raw.strip()

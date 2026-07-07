@@ -11,12 +11,17 @@ from backend.app.agent.state import AgentState
 
 logger = logging.getLogger("dhis2_analyst.renderer.dashboard")
 
+_SUPPORTED_VIZ: frozenset[str] = frozenset({"bar", "line", "pie", "scatter", "table"})
+
 
 def render_dashboard(state: AgentState) -> list[dict]:
     """Generate chart configs from DHIS2 data for Plotly rendering."""
     rows = state.get("dhis2_data", {}).get("rows", [])
     metrics = state.get("metrics", [])
-    viz_types = state.get("viz_types", ["bar"])
+    # Only render viz types we actually support; anything else (e.g. "map",
+    # which the keyword fallback can emit) would silently produce no chart and
+    # a blank dashboard. Default to a bar chart so there is always output.
+    viz_types = [v for v in state.get("viz_types", ["bar"]) if v in _SUPPORTED_VIZ] or ["bar"]
     org = state["org_unit"]["label"]
 
     logger.info(

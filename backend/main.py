@@ -12,7 +12,6 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
-from collections import defaultdict
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -23,6 +22,7 @@ from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 
 from backend.config import Settings, get_settings
+from backend.app.ratelimit import RateLimiter, create_rate_limiter
 from backend.app.agent.graph import run_agent_stream
 from backend.app.db.session import init_db, get_session
 from backend.app.db import conversations as conv_db
@@ -50,30 +50,47 @@ logging.basicConfig(
 logger = logging.getLogger("dhis2_analyst")
 
 # ---------------------------------------------------------------------------
-# Rate limiter — in-memory token bucket; swap for Redis via middleware later
+# Rate limiter — Redis-backed when REDIS_URL is set, else in-memory (see
+# backend/app/ratelimit.py).
 # ---------------------------------------------------------------------------
 
-class _InMemoryRateLimiter:
-    """Sliding-window per-key rate limiter."""
+_rate_limiter: RateLimiter | None = None
 
-    def __init__(self, rpm: int) -> None:
-        self._rpm = rpm
-        self._window = 60.0
-        self._store: dict[str, list[float]] = defaultdict(list)
+# Paths exempt from rate limiting: health check, SPA entry, and static assets
+# (SPA loads issue several of these per page; counting them starves real users
+# behind a shared NAT IP). API/auth routes are always limited.
+_RATE_LIMIT_EXEMPT_EXACT = {"/health", "/"}
+_RATE_LIMIT_EXEMPT_PREFIXES = ("/frontend", "/assets")
+_RATE_LIMIT_EXEMPT_EXTS = (
+    ".js", ".css", ".svg", ".ico", ".png", ".woff2", ".woff", ".ttf", ".map",
+)
 
-    def is_allowed(self, key: str) -> bool:
-        now = time.monotonic()
-        cutoff = now - self._window
-        bucket = [t for t in self._store[key] if t > cutoff]
-        if len(bucket) >= self._rpm:
-            self._store[key] = bucket
-            return False
-        bucket.append(now)
-        self._store[key] = bucket
+
+def _client_key_for(request: Request, settings: Settings) -> str:
+    """Resolve the rate-limit key: JWT user_id when present, else client IP."""
+    auth_header = request.headers.get("authorization", "")
+    if auth_header[:7].lower() == "bearer ":
+        identity = verify_token(auth_header[7:], settings)
+        if identity:
+            return identity.user_id
+
+    if settings.trust_proxy_headers:
+        forwarded = request.headers.get("x-forwarded-for", "")
+        if forwarded:
+            # Left-most entry is the original client.
+            return forwarded.split(",")[0].strip()
+    return request.client.host if request.client else "unknown"
+
+
+def _is_rate_limit_exempt(request: Request) -> bool:
+    if request.method == "OPTIONS":  # CORS preflight — never charge a token
         return True
-
-
-_rate_limiter: _InMemoryRateLimiter | None = None
+    path = request.url.path
+    if path in _RATE_LIMIT_EXEMPT_EXACT:
+        return True
+    if path.startswith(_RATE_LIMIT_EXEMPT_PREFIXES):
+        return True
+    return path.endswith(_RATE_LIMIT_EXEMPT_EXTS)
 
 # ---------------------------------------------------------------------------
 # Lifespan
@@ -88,14 +105,33 @@ async def _metadata_sync_loop():
     settings = get_settings()
     # Let the server finish startup before the first sync attempt.
     await asyncio.sleep(3)
+    # Retry backoff schedule (seconds) used when a sync fails or indexes nothing,
+    # so a transient DHIS2 outage at startup doesn't leave resolution broken
+    # until the next midnight.
+    backoff = [60, 300, 1800]
+    consecutive_failures = 0
     while True:
+        status = "unknown"
         try:
             logger.info("metadata_sync_started")
             result = await sync_metadata(settings)
-            logger.info("metadata_sync_finished", extra={"result_status": result.get("status", "unknown")})
+            status = result.get("status", "unknown")
+            logger.info("metadata_sync_finished", extra={"result_status": status})
         except Exception as exc:
             logger.error("metadata_sync_failed", extra={"error": str(exc)})
+            status = "failed"
 
+        if status in {"failed", "partial"}:
+            delay = backoff[min(consecutive_failures, len(backoff) - 1)]
+            consecutive_failures += 1
+            logger.warning(
+                "metadata_sync_retry_scheduled",
+                extra={"status": status, "retry_in_seconds": delay, "attempt": consecutive_failures},
+            )
+            await asyncio.sleep(delay)
+            continue
+
+        consecutive_failures = 0
         now = datetime.now(timezone.utc)
         tomorrow = now + timedelta(days=1)
         next_midnight = tomorrow.replace(hour=0, minute=0, second=0, microsecond=0)
@@ -105,13 +141,30 @@ async def _metadata_sync_loop():
         await asyncio.sleep(sleep_seconds)
 
 
+async def _temp_file_cleanup_loop():
+    """Periodically sweep expired generated files.
+
+    Startup-only cleanup lets files accumulate unboundedly on a long-running
+    server (each export up to max_file_size_bytes) until the temp dir fills and
+    every export starts failing with ENOSPC.
+    """
+    settings = get_settings()
+    interval = max(300, settings.max_file_age_seconds)
+    while True:
+        await asyncio.sleep(interval)
+        try:
+            await asyncio.to_thread(cleanup_old_files, settings)
+        except Exception as exc:
+            logger.warning("temp_file_cleanup_failed", extra={"error": str(exc)})
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global _rate_limiter
     settings = get_settings()
     settings.startup_checks()
     settings.log_resolved_settings()
-    _rate_limiter = _InMemoryRateLimiter(settings.rate_limit_rpm)
+    _rate_limiter = await create_rate_limiter(settings)
     cleanup_old_files(settings)
     
     await init_db()
@@ -139,14 +192,18 @@ async def lifespan(app: FastAPI):
             )
 
     sync_task = asyncio.create_task(_metadata_sync_loop())
-    
+    cleanup_task = asyncio.create_task(_temp_file_cleanup_loop())
+
     logger.info("startup", extra={"deployment_mode": settings.deployment_mode})
     yield
-    sync_task.cancel()
-    try:
-        await sync_task
-    except asyncio.CancelledError:
-        pass
+    for task in (sync_task, cleanup_task):
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+    if _rate_limiter is not None:
+        await _rate_limiter.aclose()
     logger.info("shutdown")
 
 
@@ -158,38 +215,23 @@ app = FastAPI(
 )
 
 # ---------------------------------------------------------------------------
-# CORS
-# ---------------------------------------------------------------------------
-
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=get_settings().cors_origin_list,
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
-# ---------------------------------------------------------------------------
 # Audit + rate-limit middleware
+#
+# Registered BEFORE CORS so that CORS ends up the OUTERMOST layer (Starlette
+# applies the last-added middleware first). That guarantees a 429 emitted here
+# still passes back through CORS and carries Access-Control-Allow-Origin, and
+# that OPTIONS preflights are answered by CORS before they can consume a token.
 # ---------------------------------------------------------------------------
 
 @app.middleware("http")
 async def audit_middleware(request: Request, call_next):
     start = time.monotonic()
-    # Identify the caller — prefer JWT user_id, fall back to IP
-    client_key = request.client.host if request.client else "unknown"
-    auth_header = request.headers.get("authorization", "")
-    if auth_header.startswith("Bearer "):
-        token = auth_header[7:]
-        settings = get_settings()
-        identity = verify_token(token, settings)
-        if identity:
-            client_key = identity.user_id
-
-    # Rate limit check (skip health + static)
+    settings = get_settings()
     path = request.url.path
-    if path not in {"/health", "/"} and not path.startswith("/frontend"):
-        if _rate_limiter and not _rate_limiter.is_allowed(client_key):
+    client_key = _client_key_for(request, settings)
+
+    if _rate_limiter and not _is_rate_limit_exempt(request):
+        if not await _rate_limiter.is_allowed(client_key):
             logger.warning("rate_limit_exceeded", extra={"client": client_key, "path": path})
             return JSONResponse(
                 status_code=429,
@@ -219,6 +261,19 @@ async def audit_middleware(request: Request, call_next):
         },
     )
     return response
+
+
+# ---------------------------------------------------------------------------
+# CORS — added last so it is the outermost middleware (see note above).
+# ---------------------------------------------------------------------------
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=get_settings().cors_origin_list,
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 
 # ---------------------------------------------------------------------------
@@ -285,6 +340,7 @@ async def chat(
     settings: Settings = Depends(get_settings),
     identity: Identity = Depends(current_identity),
     session=Depends(get_session),
+    authorization: str | None = Header(default=None),
 ):
     logger.info(
         "chat_request",
@@ -322,11 +378,54 @@ async def chat(
             "content": content
         })
 
+    # For DHIS2-authenticated users, thread the raw PAT into the agent so
+    # fetch_dhis2 makes real per-user API calls instead of falling back to mock.
+    dhis2_token = None
+    if identity.role == "dhis2_user" and authorization:
+        scheme, _, tok = authorization.partition(" ")
+        if scheme.lower() in {"bearer", "apitoken"} and tok:
+            dhis2_token = tok
+
+    async def _safe_stream():
+        """Guarantee the SSE stream always terminates with error+done.
+
+        run_agent_stream guards its named nodes, but an exception raised
+        between/inside yields (serialization, edge-case rendering) would
+        otherwise abort the chunked response with no event, leaving the
+        frontend stuck on an empty assistant bubble.
+        """
+        from backend.app.agent.graph import sse
+
+        try:
+            async for chunk in run_agent_stream(request, settings, identity, formatted_history, dhis2_token):
+                yield chunk
+        except Exception as exc:  # pragma: no cover - defensive backstop
+            logger.error("chat_stream_unhandled_error", extra={"error": str(exc)}, exc_info=True)
+            yield sse("error", {
+                "code": "STREAM_FAILED",
+                "user_message": "Something went wrong while generating the response. Please try again.",
+                "detail": str(exc),
+            })
+            yield sse("done")
+
     return StreamingResponse(
-        run_agent_stream(request, settings, identity, formatted_history),
+        _safe_stream(),
         media_type="text/event-stream",
         headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
     )
+
+
+async def _generate_and_store(settings, identity, produce, suffix, content_type):
+    """Run a blocking generator + file write in a worker thread.
+
+    WeasyPrint/python-docx/openpyxl/python-pptx are synchronous and CPU-bound
+    (seconds for a large report). Running them inline on the event loop freezes
+    every concurrent SSE chat stream; offloading keeps the loop responsive.
+    """
+    def _work():
+        return write_file(settings, produce(), suffix, content_type, session_id=identity.user_id)
+
+    return await asyncio.to_thread(_work)
 
 
 @app.post("/api/generate/docx")
@@ -335,12 +434,11 @@ async def generate_docx(
     settings: Settings = Depends(get_settings),
     identity: Identity = Depends(current_identity),
 ) -> dict:
-    data = write_file(
-        settings,
-        html_to_docx(payload.html, payload.title),
+    data = await _generate_and_store(
+        settings, identity,
+        lambda: html_to_docx(payload.html, payload.title),
         ".docx",
         "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-        session_id=identity.user_id,
     )
     return data.model_dump()
 
@@ -351,12 +449,11 @@ async def generate_pdf(
     settings: Settings = Depends(get_settings),
     identity: Identity = Depends(current_identity),
 ) -> dict:
-    data = write_file(
-        settings,
-        html_to_pdf(payload.html),
+    data = await _generate_and_store(
+        settings, identity,
+        lambda: html_to_pdf(payload.html),
         ".pdf",
         "application/pdf",
-        session_id=identity.user_id,
     )
     return data.model_dump()
 
@@ -367,12 +464,11 @@ async def generate_pptx(
     settings: Settings = Depends(get_settings),
     identity: Identity = Depends(current_identity),
 ) -> dict:
-    data = write_file(
-        settings,
-        slides_to_pptx(payload.slides, payload.title),
+    data = await _generate_and_store(
+        settings, identity,
+        lambda: slides_to_pptx(payload.slides, payload.title),
         ".pptx",
         "application/vnd.openxmlformats-officedocument.presentationml.presentation",
-        session_id=identity.user_id,
     )
     return data.model_dump()
 
@@ -383,12 +479,11 @@ async def export_xlsx(
     settings: Settings = Depends(get_settings),
     identity: Identity = Depends(current_identity),
 ) -> dict:
-    generated = write_file(
-        settings,
-        data_to_xlsx(payload.model_dump()),
+    generated = await _generate_and_store(
+        settings, identity,
+        lambda: data_to_xlsx(payload.model_dump()),
         ".xlsx",
         "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        session_id=identity.user_id,
     )
     generated.row_count = len(payload.rows)
     return generated.model_dump()
@@ -400,12 +495,11 @@ async def export_csv(
     settings: Settings = Depends(get_settings),
     identity: Identity = Depends(current_identity),
 ) -> dict:
-    generated = write_file(
-        settings,
-        data_to_csv(payload.model_dump()),
+    generated = await _generate_and_store(
+        settings, identity,
+        lambda: data_to_csv(payload.model_dump()),
         ".csv",
         "text/csv",
-        session_id=identity.user_id,
     )
     generated.row_count = len(payload.rows)
     return generated.model_dump()
@@ -424,20 +518,42 @@ async def download(
 
 
 @app.get("/api/metadata/search")
-async def metadata_search(q: str, settings: Settings = Depends(get_settings)) -> dict:
-    from backend.app.agent.intent import KNOWN_METRICS
-    q_lower = q.lower()
-    results = []
-    for key, (label, uid) in KNOWN_METRICS.items():
-        if q_lower in key or q_lower in label.lower():
-            results.append({"label": label, "uid": uid, "confidence": 0.90})
-    if not results:
-        results = [{"label": label, "uid": uid, "confidence": 0.70} for _, (label, uid) in list(KNOWN_METRICS.items())[:3]]
-    return {"query": q, "results": results[:10]}
+async def metadata_search(
+    q: str,
+    settings: Settings = Depends(get_settings),
+    identity: Identity = Depends(current_identity),
+) -> dict:
+    """Search the synced metadata index for indicators matching ``q``."""
+    from backend.app.db.metadata_index import search_indicator_by_name
+    from backend.app.db.session import get_db_session
+
+    if not q or not q.strip():
+        return {"query": q, "results": []}
+
+    try:
+        async with get_db_session() as session:
+            matches = await search_indicator_by_name(
+                session, q.strip(), is_postgres=settings.is_postgres, limit=10
+            )
+    except Exception as exc:
+        logger.warning("metadata_search_failed", extra={"error": str(exc)})
+        raise HTTPException(status_code=503, detail="Metadata index is unavailable.")
+
+    results = [
+        {"label": m["label"], "uid": m["uid"], "confidence": m["uid_confidence"]}
+        for m in matches
+    ]
+    return {"query": q, "results": results}
 
 
 @app.post("/api/metadata/sync")
-async def metadata_sync(settings: Settings = Depends(get_settings)) -> dict:
+async def metadata_sync(
+    settings: Settings = Depends(get_settings),
+    identity: Identity = Depends(current_identity),
+) -> dict:
+    # Heavy DHIS2 fan-out + bulk DB writes — must not be anonymously triggerable.
+    if identity.role not in {"admin", "dhis2_user"}:
+        raise HTTPException(status_code=403, detail="Not permitted to trigger metadata sync.")
     return await sync_metadata(settings)
 
 
@@ -492,7 +608,10 @@ async def rename_conversation(
     identity: Identity = Depends(current_identity),
     session=Depends(get_session),
 ) -> dict:
-    title = body.get("title", "").strip()
+    raw_title = body.get("title", "")
+    if not isinstance(raw_title, str):
+        raise HTTPException(status_code=422, detail="title must be a string")
+    title = raw_title.strip()[:200]
     if not title:
         raise HTTPException(status_code=422, detail="title is required")
     updated = await conv_db.update_title(session, conv_id, identity.user_id, title)
@@ -511,8 +630,16 @@ async def add_message(
     conv = await conv_db.get_conversation(session, conv_id, identity.user_id)
     if not conv:
         raise HTTPException(status_code=404, detail="Conversation not found")
+    # Only user/assistant turns may be stored — they are replayed verbatim into
+    # the intent LLM prompt, so an arbitrary "system"/"tool" role would let a
+    # client inject instructions (or break the provider call → silent degrade).
     role = body.get("role", "user")
+    if role not in {"user", "assistant"}:
+        raise HTTPException(status_code=422, detail="role must be 'user' or 'assistant'")
     content = body.get("content", "")
+    if not isinstance(content, str):
+        raise HTTPException(status_code=422, detail="content must be a string")
+    content = content[:16000]
     artefacts = body.get("artefacts")
     msg = await conv_db.add_message(session, conv_id, role, content, artefacts)
     return msg
@@ -563,7 +690,13 @@ async def catch_all(full_path: str):
         raise HTTPException(status_code=404, detail="Source file not served. Build the frontend first.")
     if any(full_path.endswith(ext) for ext in _STATIC_EXTS):
         for base in [FRONTEND_DIST, FRONTEND_ROOT]:
-            candidate = base / full_path
+            base_resolved = base.resolve()
+            candidate = (base / full_path).resolve()
+            # Contain within the frontend tree — percent-decoded '../' segments
+            # must not escape it and serve arbitrary files from disk.
+            if not candidate.is_relative_to(base_resolved):
+                logger.warning("catch_all_path_traversal_blocked", extra={"path": full_path})
+                continue
             if candidate.exists() and candidate.is_file():
                 return FileResponse(candidate)
     # SPA fallback — only from the dist build.

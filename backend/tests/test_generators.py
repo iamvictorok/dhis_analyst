@@ -101,3 +101,57 @@ def test_csv_empty_data():
     text = result.decode("utf-8")
     assert "A" in text
     assert "B" in text
+
+
+def test_docx_does_not_double_render_nested_blocks():
+    import io
+    from docx import Document
+    # A <p> nested inside <li> must appear exactly once, not duplicated as its
+    # own standalone paragraph.
+    html = "<ul><li><p>Investigate outliers in Bo.</p></li></ul>"
+    doc = Document(io.BytesIO(html_to_docx(html, "T")))
+    occurrences = sum(1 for p in doc.paragraphs if "Investigate outliers in Bo." in p.text)
+    assert occurrences == 1
+
+
+def test_fallback_pdf_is_structurally_valid():
+    from backend.app.generators.pdf_gen import _fallback_pdf
+    pdf = _fallback_pdf("<h1>Title</h1><p>Body content for the report.</p>")
+    assert pdf.startswith(b"%PDF-")
+    # Mandatory cross-reference structures that strict parsers require.
+    assert b"\nxref\n" in pdf
+    assert b"startxref\n" in pdf
+    assert pdf.rstrip().endswith(b"%%EOF")
+    # startxref offset must point at the actual "xref" keyword.
+    xref_kw = pdf.index(b"\nxref\n") + 1
+    declared = int(pdf.split(b"startxref\n")[1].split(b"\n")[0])
+    assert declared == xref_kw
+
+
+def test_pptx_chart_slide_renders_native_chart():
+    import io
+    from pptx import Presentation
+    slides = [{
+        "type": "chart",
+        "title": "Malaria Trend",
+        "content": {},
+        "data": {"x": ["2025Q1", "2025Q2"], "y": [1200, 1500], "labels": ["Bo", "Bo"]},
+    }]
+    prs = Presentation(io.BytesIO(slides_to_pptx(slides, "Deck")))
+    has_chart = any(
+        getattr(shape, "has_chart", False)
+        for slide in prs.slides
+        for shape in slide.shapes
+    )
+    assert has_chart
+
+
+def test_pptx_chart_slide_falls_back_to_text_without_data():
+    import io
+    from pptx import Presentation
+    # No valid data → no native chart, but the deck must still generate.
+    slides = [{"type": "chart", "title": "Empty Chart", "content": {"title": "x"}, "data": {}}]
+    result = slides_to_pptx(slides, "Deck")
+    assert result[:2] == b"PK"
+    prs = Presentation(io.BytesIO(result))
+    assert len(prs.slides) >= 2  # title slide + the chart slide

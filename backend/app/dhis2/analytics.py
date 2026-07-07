@@ -31,61 +31,122 @@ def build_analytics_params(state: AgentState) -> dict[str, Any]:
     ou_level = state["org_unit"]["level"]
     ou_uid = state["org_unit"].get("uid", "")
     ou_label = state["org_unit"].get("label", "")
-    disaggregations = state.get("disaggregations", [])
-    if "ou_children" in disaggregations:
-        ou_level += 1
-        disaggregations = [d for d in disaggregations if d != "ou_children"]
+    all_disaggregations = state.get("disaggregations", [])
+    wants_children = "ou_children" in all_disaggregations
+    disaggregations = [d for d in all_disaggregations if d != "ou_children"]
+    child_level = ou_level + 1 if wants_children else ou_level
 
-    if "ou_children" in state.get("disaggregations", []) and DHIS2_UID_RE.match(ou_uid):
-        ou = f"LEVEL-{ou_level};{ou_uid}"
-    elif DHIS2_UID_RE.match(ou_uid):
+    ou_is_uid = bool(DHIS2_UID_RE.match(ou_uid))
+    is_national = ou_label.lower() in {"national", "federal"}
+
+    if ou_is_uid and wants_children:
+        ou = f"LEVEL-{child_level};{ou_uid}"
+    elif ou_is_uid:
         ou = ou_uid
-    elif ou_label.lower() in {"national", "federal"}:
-        ou = "USER_ORGUNIT"
+    elif is_national:
+        # Honour a per-child breakdown for national scope too, instead of
+        # silently dropping it and returning a single aggregate row.
+        ou = f"USER_ORGUNIT;LEVEL-{child_level}" if wants_children else "USER_ORGUNIT"
     else:
+        # A named org unit that never resolved to a real UID (e.g. "UNRESOLVED"
+        # or a leftover label) must NOT be sent as a dimension item — DHIS2
+        # rejects it with a 409. Fall back to the caller's own org scope.
         logger.warning(
             "analytics_org_unit_unresolved",
             extra={"org_unit_label": ou_label, "org_unit_uid": ou_uid},
         )
-        ou = ou_uid or "USER_ORGUNIT"
+        ou = f"USER_ORGUNIT;LEVEL-{child_level}" if wants_children else "USER_ORGUNIT"
 
     pe = _join_dimension_items(state["periods"])
-    
+
     params: dict[str, Any] = {
         "dimension": [f"dx:{dx}", f"ou:{ou}", f"pe:{pe}"],
         "displayProperty": "NAME",
         "outputIdScheme": "NAME",
         "skipMeta": "false",
     }
-    if disaggregations:
-        params["dimension"].append(f"co:{_join_dimension_items(disaggregations)}")
+    # Only append a category-option-combo dimension for real COC UIDs. Free-text
+    # tokens the LLM may emit ("sex", "age") are not valid co items and 409.
+    co_items = [d for d in disaggregations if DHIS2_UID_RE.match(d)]
+    dropped = [d for d in disaggregations if not DHIS2_UID_RE.match(d)]
+    if dropped:
+        logger.warning("analytics_dropped_invalid_disaggregations", extra={"tokens": dropped})
+    if co_items:
+        params["dimension"].append(f"co:{_join_dimension_items(co_items)}")
     logger.info("build_analytics_params_complete", extra={"params": params})
     return params
 
 
+# Canonical internal row layout shared with the mock data path and every
+# renderer/node that consumes analytics rows positionally.
+CANONICAL_HEADERS = ["Organisation unit", "Period", "Value", "Metric"]
+
+
 def normalise_analytics_response(raw: dict[str, Any], params: dict[str, Any]) -> dict[str, Any]:
-    logger.info(
-        "normalise_analytics_response_start",
-        extra={
-            "rows_count": len(raw.get("rows", [])),
-            "headers_count": len(raw.get("headers", [])),
-        }
-    )
-    headers = [h.get("column", h.get("name", "")) for h in raw.get("headers", [])]
+    """Reorder a raw DHIS2 analytics response into the canonical row layout.
+
+    DHIS2 returns columns in requested-dimension order (dx, ou, pe, ...) with
+    the numeric value last — e.g. ``[metric, org, period, value]``. Every
+    downstream consumer, however, assumes the mock layout
+    ``[org, period, value, metric]``. Without reordering here, real data renders
+    as zeros/garbage while mock mode looks perfect — a primary cause of the
+    "works sometimes" behaviour. We map columns by their DHIS2 header id
+    (``dx``/``ou``/``pe``/``value``) and fall back to pass-through only when the
+    layout is unrecognised.
+    """
+    raw_headers = raw.get("headers", [])
     rows = raw.get("rows", [])
     metadata = raw.get("metaData", {})
-    width = len(headers)
-    malformed_rows = sum(1 for row in rows if width and len(row) != width)
-    if malformed_rows:
-        logger.warning(
-            "analytics_response_row_width_mismatch",
-            extra={
-                "rows_count": len(rows),
-                "headers_count": width,
-                "malformed_rows": malformed_rows,
+
+    logger.info(
+        "normalise_analytics_response_start",
+        extra={"rows_count": len(rows), "headers_count": len(raw_headers)},
+    )
+
+    # DHIS2 headers carry the dimension id in "name"; the test/legacy shape puts
+    # it in "column". Check both.
+    def header_id(h: dict) -> str:
+        return str(h.get("name") or h.get("column") or "").lower()
+
+    col: dict[str, int] = {}
+    for i, h in enumerate(raw_headers):
+        hid = header_id(h)
+        if hid in {"dx", "ou", "pe", "value", "co"} and hid not in col:
+            col[hid] = i
+
+    # Reorder only when we can identify the value column plus at least one of the
+    # dimension columns; otherwise preserve the original rows untouched.
+    if "value" in col and ("ou" in col or "dx" in col or "pe" in col):
+        oi, pi, vi, mi = col.get("ou"), col.get("pe"), col.get("value"), col.get("dx")
+
+        def cell(row: list, idx: int | None) -> Any:
+            return row[idx] if idx is not None and idx < len(row) else ""
+
+        canonical_rows = [
+            [cell(r, oi), cell(r, pi), cell(r, vi), cell(r, mi)] for r in rows
+        ]
+        normalised = {
+            "rows": canonical_rows,
+            "headers": CANONICAL_HEADERS,
+            "metadata": {
+                "raw_metadata": metadata,
+                "data_source": "analytics_api",
+                "analytics_params": params,
             },
+        }
+        logger.info(
+            "normalise_analytics_response_complete",
+            extra={"rows_count": len(canonical_rows), "reordered": True},
         )
-    normalised = {
+        return normalised
+
+    # Unrecognised layout — pass through with best-effort headers.
+    headers = [h.get("column", h.get("name", "")) for h in raw_headers]
+    logger.warning(
+        "analytics_response_layout_unrecognised",
+        extra={"headers": headers},
+    )
+    return {
         "rows": rows,
         "headers": headers or ["Organisation unit", "Period", "Value"],
         "metadata": {
@@ -94,5 +155,3 @@ def normalise_analytics_response(raw: dict[str, Any], params: dict[str, Any]) ->
             "analytics_params": params,
         },
     }
-    logger.info("normalise_analytics_response_complete", extra={"rows_count": len(rows)})
-    return normalised

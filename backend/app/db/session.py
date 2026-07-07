@@ -58,6 +58,10 @@ def _get_engine():
                 cursor.execute("PRAGMA journal_mode=WAL")
                 cursor.execute("PRAGMA busy_timeout=5000")
                 cursor.execute("PRAGMA synchronous=NORMAL")
+                # SQLite ignores FK constraints unless enabled per connection —
+                # without this, ON DELETE CASCADE is a no-op and deleting a
+                # conversation orphans its (health-query) messages forever.
+                cursor.execute("PRAGMA foreign_keys=ON")
                 cursor.close()
 
             logger.info("db_sqlite_wal_enabled")
@@ -119,14 +123,17 @@ async def init_db() -> None:
                 ON metadata_index USING ivfflat (embedding vector_cosine_ops)
                 WITH (lists = 100)
             """))
-            # Conversation history
+            # Conversation history. Timestamps are stored as ISO-8601 TEXT to
+            # match the values the persistence layer binds (asyncpg rejects a
+            # Python str bound to a TIMESTAMPTZ column). ISO-8601 sorts
+            # lexicographically in chronological order, so ORDER BY still works.
             await conn.execute(text("""
                 CREATE TABLE IF NOT EXISTS conversations (
                     id TEXT PRIMARY KEY,
                     user_id TEXT NOT NULL,
                     title TEXT NOT NULL DEFAULT 'New chat',
-                    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-                    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
                 )
             """))
             await conn.execute(text("""
@@ -140,13 +147,28 @@ async def init_db() -> None:
                     role TEXT NOT NULL,
                     content TEXT NOT NULL DEFAULT '',
                     artefacts JSONB,
-                    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                    created_at TEXT NOT NULL
                 )
             """))
             await conn.execute(text("""
                 CREATE INDEX IF NOT EXISTS msg_conv_idx
                 ON messages(conversation_id, created_at)
             """))
+            # Idempotent migration: earlier revisions declared these timestamp
+            # columns TIMESTAMPTZ, but the persistence layer binds ISO strings
+            # (asyncpg rejects str→timestamptz). Convert any pre-existing tables
+            # to TEXT. ALTER ... TYPE TEXT is a no-op when already TEXT.
+            for tbl, col in (
+                ("conversations", "created_at"), ("conversations", "updated_at"),
+                ("messages", "created_at"),
+            ):
+                try:
+                    await conn.execute(text(
+                        f"ALTER TABLE {tbl} ALTER COLUMN {col} TYPE TEXT "
+                        f"USING {col}::text"
+                    ))
+                except Exception as exc:
+                    logger.warning("db_timestamp_migration_skipped", extra={"table": tbl, "column": col, "error": str(exc)})
             logger.info("db_init_postgres_complete")
         else:
             # SQLite schema (no vector support)

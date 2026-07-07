@@ -36,14 +36,21 @@ def render_report(state: AgentState) -> str:
         }
     )
 
-    values = []
+    # Parse (period, value) pairs together in one pass so a value always keeps
+    # its own period label. Collecting values separately and later indexing
+    # rows[i] misaligns every pair after a skipped (non-numeric) row.
+    parsed: list[tuple[str, float]] = []
     for row in rows:
+        if len(row) <= 2:
+            continue
         try:
-            if len(row) > 2:
-                values.append(float(row[2]))
+            value = float(row[2])
         except (ValueError, TypeError):
-            pass
+            continue
+        period = str(row[1]) if len(row) > 1 else ""
+        parsed.append((period, value))
 
+    values = [v for _, v in parsed]
     total = sum(values)
     avg = total / len(values) if values else 0
 
@@ -95,15 +102,15 @@ def render_report(state: AgentState) -> str:
     parts.append('</tbody></table>')
 
     # Trend Analysis
-    if len(values) >= 2:
+    if len(parsed) >= 2:
         parts.append('<h2>Trend Analysis</h2>')
         parts.append('<p>Period-over-period changes:</p>')
         parts.append('<ul>')
-        for i in range(1, min(len(values), len(rows))):
-            prev_val = values[i - 1]
-            curr_val = values[i]
-            prev_period = str(rows[i - 1][1]) if len(rows[i - 1]) > 1 else f"Period {i}"
-            curr_period = str(rows[i][1]) if len(rows[i]) > 1 else f"Period {i + 1}"
+        for i in range(1, len(parsed)):
+            prev_period, prev_val = parsed[i - 1]
+            curr_period, curr_val = parsed[i]
+            prev_period = prev_period or f"Period {i}"
+            curr_period = curr_period or f"Period {i + 1}"
             if prev_val > 0:
                 change = ((curr_val - prev_val) / prev_val) * 100
                 direction = "↑" if change > 0 else "↓"

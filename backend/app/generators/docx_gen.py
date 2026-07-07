@@ -54,7 +54,14 @@ def html_to_docx(html: str, title: str = "DHIS2 Analyst Report") -> bytes:
         run.font.color.rgb = RGBColor(0x0B, 0x17, 0x1D)
 
     # --- Walk HTML nodes ---
+    # Only render TOP-LEVEL blocks. A nested block (e.g. <p> inside <li>, or a
+    # <ul> inside <li>, or a <table> inside <td>) already has its text emitted by
+    # its container's get_text(); rendering it again as its own element produces
+    # duplicated paragraphs. Skip any block that lives inside another block.
+    _CONTAINER_TAGS = ["p", "li", "ul", "ol", "table", "th", "td"]
     for node in soup.find_all(["h1", "h2", "h3", "h4", "p", "ul", "ol", "table"], recursive=True):
+        if node.find_parent(_CONTAINER_TAGS):
+            continue
         if node.name in {"h1", "h2", "h3", "h4"}:
             level = int(node.name[1])
             heading = doc.add_heading(_text(node), level=level)

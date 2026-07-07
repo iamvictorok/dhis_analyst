@@ -47,6 +47,7 @@ async def sync_metadata(settings: Settings) -> dict[str, Any]:
 
     client = DHIS2Client(settings)
     totals = {"synced": 0, "skipped": 0, "failed": 0}
+    endpoints_failed: list[str] = []
 
     logger.info("metadata_sync_started", extra={"dhis2_base_url": settings.dhis2_base_url})
 
@@ -95,19 +96,33 @@ async def sync_metadata(settings: Settings) -> dict[str, Any]:
                 "metadata_endpoint_failed",
                 extra={"endpoint": endpoint, "error": str(exc)},
             )
-            totals["failed"] += 1
+            endpoints_failed.append(endpoint)
 
     total_duration = time.time() - start_time
+
+    # Distinguish a healthy sync from a misconfiguration (bad credentials, wrong
+    # base URL, timeout). "complete" that indexed nothing previously hid a fully
+    # broken sync and left every NL query dead-ending against an empty index.
+    if endpoints_failed and len(endpoints_failed) == len(SYNC_ENDPOINTS):
+        status = "failed"
+    elif endpoints_failed:
+        status = "partial"
+    else:
+        status = "complete"
+
     logger.info(
         "metadata_sync_complete",
         extra={
             **totals,
+            "status": status,
+            "endpoints_failed": endpoints_failed,
             "total_duration_seconds": round(total_duration, 3),
         },
     )
     return {
-        "status": "complete",
+        "status": status,
         **totals,
+        "endpoints_failed": endpoints_failed,
         "synced_at": datetime.now(timezone.utc).isoformat(),
         "dhis2_base_url": settings.dhis2_base_url,
     }

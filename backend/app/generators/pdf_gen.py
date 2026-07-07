@@ -134,18 +134,18 @@ strong {{
 
 
 def _fallback_pdf(html: str) -> bytes:
-    """Generate a minimal valid PDF when WeasyPrint is unavailable."""
-    # Strip HTML tags for plain text
+    """Generate a minimal but SPEC-VALID PDF when WeasyPrint is unavailable.
+
+    Emits the mandatory cross-reference table and ``startxref`` offset (ISO
+    32000 §7.5.4-7.5.5) so strict viewers/parsers accept the file, not just
+    lenient repair-scanning ones.
+    """
     import re
     text = re.sub(r"<[^>]+>", " ", html)
     text = re.sub(r"\s+", " ", text).strip()
     safe = text[:3000].encode("latin-1", "replace").decode("latin-1")
 
-    # Split into lines for multi-line rendering
-    lines = []
-    while safe:
-        lines.append(safe[:100])
-        safe = safe[100:]
+    lines = [safe[i:i + 100] for i in range(0, len(safe), 100)]
 
     stream_parts = []
     y = 760
@@ -157,13 +157,37 @@ def _fallback_pdf(html: str) -> bytes:
             break
 
     stream = "\n".join(stream_parts)
-    objects = [
-        "1 0 obj << /Type /Catalog /Pages 2 0 R >> endobj",
-        "2 0 obj << /Type /Pages /Kids [3 0 R] /Count 1 >> endobj",
-        f"3 0 obj << /Type /Page /Parent 2 0 R /MediaBox [0 0 595 842] "
-        f"/Resources << /Font << /F1 4 0 R >> >> /Contents 5 0 R >> endobj",
-        "4 0 obj << /Type /Font /Subtype /Type1 /BaseFont /Helvetica >> endobj",
-        f"5 0 obj << /Length {len(stream)} >> stream\n{stream}\nendstream endobj",
+    stream_bytes = stream.encode("latin-1")
+
+    # Object bodies (without the "N 0 obj" wrapper), in order.
+    bodies = [
+        b"<< /Type /Catalog /Pages 2 0 R >>",
+        b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
+        b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 595 842] "
+        b"/Resources << /Font << /F1 4 0 R >> >> /Contents 5 0 R >>",
+        b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>",
+        b"<< /Length " + str(len(stream_bytes)).encode("latin-1") + b" >>\nstream\n"
+        + stream_bytes + b"\nendstream",
     ]
-    body = "\n".join(objects)
-    return f"%PDF-1.4\n{body}\ntrailer << /Root 1 0 R >>\n%%EOF".encode("latin-1")
+
+    buf = bytearray(b"%PDF-1.4\n")
+    offsets: list[int] = []
+    for i, body in enumerate(bodies, start=1):
+        offsets.append(len(buf))
+        buf += f"{i} 0 obj\n".encode("latin-1") + body + b"\nendobj\n"
+
+    xref_offset = len(buf)
+    size = len(bodies) + 1  # +1 for the free object 0
+
+    buf += f"xref\n0 {size}\n".encode("latin-1")
+    buf += b"0000000000 65535 f\r\n"  # object 0 is always the free-list head
+    for off in offsets:
+        buf += f"{off:010d} 00000 n\r\n".encode("latin-1")  # 20-byte entries
+
+    buf += b"trailer\n"
+    buf += f"<< /Size {size} /Root 1 0 R >>\n".encode("latin-1")
+    buf += b"startxref\n"
+    buf += f"{xref_offset}\n".encode("latin-1")
+    buf += b"%%EOF"
+
+    return bytes(buf)

@@ -73,27 +73,50 @@ class DHIS2Client:
         self,
         endpoint: str,
         fields: str = "id,name,shortName,description",
-        paging: bool = False,
+        page_size: int = 1000,
+        max_pages: int = 1000,
     ) -> list[dict[str, Any]]:
-        """Fetch metadata objects from a DHIS2 metadata endpoint.
+        """Fetch ALL metadata objects from a DHIS2 metadata endpoint, paginated.
+
+        Real instances hold tens of thousands of org units / data elements; a
+        single unpaged pull routinely exceeds the read timeout. This follows the
+        response ``pager`` (pageSize per request) until exhausted.
 
         Args:
             endpoint: e.g. "dataElements", "indicators", "organisationUnits"
             fields: DHIS2 field filter
-            paging: Whether to request paged results
+            page_size: objects per page request
+            max_pages: hard cap to guard against a pager that never terminates
         """
-        params: dict[str, Any] = {
-            "fields": fields,
-            "paging": str(paging).lower(),
-        }
-        data = await self._get(f"/api/{endpoint}.json", params=params)
+        results: list[dict[str, Any]] = []
+        page = 1
+        while page <= max_pages:
+            params: dict[str, Any] = {
+                "fields": fields,
+                "paging": "true",
+                "pageSize": page_size,
+                "page": page,
+            }
+            data = await self._get(f"/api/{endpoint}.json", params=params)
 
-        # DHIS2 wraps results in a key matching the endpoint name
-        # e.g. {"dataElements": [...]} or {"indicators": [...]}
-        for key in data:
-            if isinstance(data[key], list):
-                return data[key]
-        return []
+            # DHIS2 wraps results in a key matching the endpoint name, alongside
+            # a "pager" dict. Take the first list-valued key.
+            items = next((v for v in data.values() if isinstance(v, list)), [])
+            results.extend(items)
+
+            pager = data.get("pager") or {}
+            # Stop when the server signals no further pages (no nextPage), when a
+            # page came back empty, or when the response wasn't paged at all.
+            if not items or not pager.get("nextPage"):
+                break
+            page += 1
+
+        if page > max_pages:
+            logger.warning(
+                "metadata_pagination_cap_reached",
+                extra={"endpoint": endpoint, "max_pages": max_pages, "fetched": len(results)},
+            )
+        return results
 
     async def me(self) -> dict[str, Any]:
         """Fetch current user profile — used for token validation."""
@@ -129,6 +152,15 @@ class DHIS2Client:
                         await _sleep_before_retry(attempt)
                         continue
                     response.raise_for_status()
+                    # A 200 text/html body means we followed a redirect to the
+                    # DHIS2 login page — i.e. the request was unauthenticated.
+                    # Surface that clearly instead of a cryptic JSON decode error.
+                    content_type = response.headers.get("content-type", "")
+                    if "text/html" in content_type.lower():
+                        raise RuntimeError(
+                            "DHIS2 returned an HTML page instead of JSON — the request was "
+                            "likely redirected to the login page (missing/invalid credentials)."
+                        )
                     payload = response.json()
                     if not isinstance(payload, dict):
                         raise ValueError("DHIS2 returned a non-object JSON payload.")
@@ -144,7 +176,10 @@ class DHIS2Client:
                         },
                     )
                     return payload
-            except (httpx.ConnectError, httpx.ReadTimeout, httpx.ConnectTimeout) as exc:
+            except httpx.TransportError as exc:
+                # Base class of ConnectError/ReadTimeout/ConnectTimeout AND the
+                # transient failures previously missed (RemoteProtocolError,
+                # ReadError, WriteError, PoolTimeout) — all worth retrying.
                 last_exc = exc
                 if attempt < MAX_ATTEMPTS - 1:
                     logger.warning(

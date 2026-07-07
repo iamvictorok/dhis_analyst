@@ -36,8 +36,18 @@ async def complete(
     Raises:
         RuntimeError: If the LLM call fails and provider is not mock.
     """
+    if settings.llm_provider == "mock":
+        return _mock_completion(messages, json_mode=json_mode)
+
     try:
         import litellm
+
+        # Let LiteLLM drop provider-unsupported params (e.g. response_format on
+        # models without JSON mode) instead of raising — otherwise every intent
+        # call fails on such providers and the pipeline silently degrades to the
+        # keyword classifier. The markdown-fence JSON cleanup path handles the
+        # non-strict output.
+        litellm.drop_params = True
 
         model = _resolve_model(settings)
         kwargs: dict[str, Any] = {
@@ -91,7 +101,10 @@ async def complete(
 async def embed(text: str, settings: Settings) -> list[float]:
     """Generate a text embedding vector for semantic search.
 
-    Falls back to an empty list on mock mode (pgvector disabled).
+    Returns an empty list ONLY in mock mode (pgvector disabled). Real provider
+    errors are raised so callers can distinguish "embeddings intentionally off"
+    from "embedding backend failed" and degrade appropriately instead of
+    silently treating a transient outage as an empty result.
     """
     if settings.embedding_provider == "mock":
         return []
@@ -130,7 +143,34 @@ async def embed(text: str, settings: Settings) -> list[float]:
         return vector
     except Exception as exc:
         logger.error("embed_failed", extra={"error": str(exc)})
-        return []
+        raise RuntimeError(f"Embedding call failed ({settings.embedding_provider}): {exc}") from exc
+
+
+def _mock_completion(messages: list[dict[str, str]], *, json_mode: bool) -> str:
+    """Deterministic local response for LLM_PROVIDER=mock.
+
+    Intent classification in mock mode is handled upstream by the deterministic
+    classifier, so this only needs to serve content generation (reports and
+    conversational replies) with clearly-labelled placeholder text.
+    """
+    if json_mode:
+        return "{}"
+    last_user = ""
+    for msg in reversed(messages):
+        if msg.get("role") == "user":
+            last_user = msg.get("content", "")
+            break
+    if "HTML" in last_user:
+        return (
+            "<h1>Report (mock mode)</h1>"
+            "<p>This report was generated in mock mode without a live LLM. "
+            "Configure a real LLM provider for narrative analysis.</p>"
+        )
+    return (
+        "**Mock mode** — no LLM provider is configured, so I can't generate a "
+        "narrative answer. The underlying DHIS2 data is still available in the "
+        "dashboard/table above. Set a real `LLM_PROVIDER` to enable full analysis."
+    )
 
 
 def _resolve_model(settings: Settings) -> str:

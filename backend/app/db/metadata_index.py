@@ -12,6 +12,16 @@ from typing import Any
 logger = logging.getLogger("dhis2_analyst.metadata_index")
 
 
+def _escape_like(term: str) -> str:
+    r"""Escape LIKE wildcards so user/LLM text is matched literally.
+
+    Without this, a ``%`` in the term matches every row and ``_`` matches any
+    character, which — combined with LIMIT — returns an arbitrary row as a
+    "confident" match. Paired with ``ESCAPE '\'`` in the SQL.
+    """
+    return term.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+
+
 async def search_by_embedding(
     session,
     embedding: list[float],
@@ -52,18 +62,22 @@ async def search_by_keyword(
     """Search metadata by keyword match (SQLite compatible)."""
     from sqlalchemy import text
 
-    pattern = f"%{term}%"
+    pattern = f"%{_escape_like(term)}%"
     result = await session.execute(
-        text("""
+        text(r"""
             SELECT uid, name, object_type, short_name, description
             FROM metadata_index_lite
-            WHERE name LIKE :pattern
-               OR short_name LIKE :pattern
-               OR description LIKE :pattern
-               OR dataset_names LIKE :pattern
+            WHERE name LIKE :pattern ESCAPE '\'
+               OR short_name LIKE :pattern ESCAPE '\'
+               OR description LIKE :pattern ESCAPE '\'
+               OR dataset_names LIKE :pattern ESCAPE '\'
+            ORDER BY
+                CASE WHEN LOWER(name) = LOWER(:term) THEN 0 ELSE 1 END,
+                LENGTH(name),
+                uid
             LIMIT :lim
         """),
-        {"pattern": pattern, "lim": limit},
+        {"pattern": pattern, "term": term, "lim": limit},
     )
     return [
         {
@@ -72,7 +86,7 @@ async def search_by_keyword(
             "object_type": row[2],
             "short_name": row[3],
             "description": row[4],
-            "uid_confidence": 0.75,  # Fixed confidence for keyword matches
+            "uid_confidence": 0.95 if row[1].lower() == term.lower() else 0.70,
         }
         for row in result.fetchall()
     ]
@@ -121,6 +135,7 @@ async def search_org_unit_by_name(
                 FROM {table}
                 WHERE object_type = 'orgUnit'
                   AND LOWER(name) = LOWER(:name)
+                ORDER BY uid
                 LIMIT :lim
             """),
             {"name": term, "lim": limit},
@@ -129,15 +144,16 @@ async def search_org_unit_by_name(
         if rows:
             break
 
-        # 2. Fall back to LIKE pattern match
-        pattern = f"%{term}%"
+        # 2. Fall back to LIKE pattern match (shortest/most-specific name first)
+        pattern = f"%{_escape_like(term)}%"
         result = await session.execute(
-            text(f"""
+            text(rf"""
                 SELECT uid, name, short_name, raw_metadata
                 FROM {table}
                 WHERE object_type = 'orgUnit'
-                  AND (LOWER(name) LIKE LOWER(:pattern)
-                       OR LOWER(short_name) LIKE LOWER(:pattern))
+                  AND (LOWER(name) LIKE LOWER(:pattern) ESCAPE '\'
+                       OR LOWER(short_name) LIKE LOWER(:pattern) ESCAPE '\')
+                ORDER BY LENGTH(name), uid
                 LIMIT :lim
             """),
             {"pattern": pattern, "lim": limit},
@@ -197,6 +213,7 @@ async def search_indicator_by_name(
         search_terms.append(cleaned)
 
     rows = []
+    matched_exact = False
     for term in search_terms:
         # 1. Exact case-insensitive match
         result = await session.execute(
@@ -205,23 +222,28 @@ async def search_indicator_by_name(
                 FROM {table}
                 WHERE object_type IN ('indicator', 'dataElement', 'programIndicator')
                   AND LOWER(name) = LOWER(:name)
+                ORDER BY LENGTH(name), uid
                 LIMIT :lim
             """),
             {"name": term, "lim": limit},
         )
         rows = result.fetchall()
         if rows:
+            matched_exact = True
             break
 
-        # 2. LIKE pattern match
-        pattern = f"%{term}%"
+        # 2. LIKE pattern match — shortest (most specific) name first, with uid
+        # as a stable tiebreaker so the same query resolves the same way across
+        # syncs (previously order was unspecified → nondeterministic UID).
+        pattern = f"%{_escape_like(term)}%"
         result = await session.execute(
-            text(f"""
+            text(rf"""
                 SELECT uid, name, object_type, short_name, description
                 FROM {table}
                 WHERE object_type IN ('indicator', 'dataElement', 'programIndicator')
-                  AND (LOWER(name) LIKE LOWER(:pattern)
-                       OR LOWER(short_name) LIKE LOWER(:pattern))
+                  AND (LOWER(name) LIKE LOWER(:pattern) ESCAPE '\'
+                       OR LOWER(short_name) LIKE LOWER(:pattern) ESCAPE '\')
+                ORDER BY LENGTH(name), uid
                 LIMIT :lim
             """),
             {"pattern": pattern, "lim": limit},
@@ -230,14 +252,24 @@ async def search_indicator_by_name(
         if rows:
             break
 
-    return [
-        {
+    results = []
+    for row in rows:
+        exact_name = row[1].lower() == name.lower()
+        # Graded confidence: an exact name match clears the disambiguation gate;
+        # a bare substring match stays below it so weak guesses surface
+        # candidates instead of being silently charted as the answer.
+        if exact_name:
+            confidence = 0.95
+        elif matched_exact:
+            confidence = 0.85
+        else:
+            confidence = 0.65
+        results.append({
             "uid": row[0],
             "label": row[1],
             "object_type": row[2],
             "short_name": row[3],
             "description": row[4],
-            "uid_confidence": 0.85,
-        }
-        for row in rows
-    ]
+            "uid_confidence": confidence,
+        })
+    return results
