@@ -88,6 +88,8 @@ async def resolve_metadata(state: AgentState, settings: Settings) -> AgentState:
         else:
             # Genuine low/no-confidence match — query candidates PER label so a
             # multi-indicator request doesn't collapse into one junk LIKE.
+            # INSTEAD of asking the user for clarification, we auto-resolve using the best available
+            # guess, because the user may not know the exact DHIS2 terms.
             candidates: list[dict] = []
             for label in labels:
                 candidates.extend(await _keyword_candidates_from_db(label, settings))
@@ -99,24 +101,13 @@ async def resolve_metadata(state: AgentState, settings: Settings) -> AgentState:
                         seen.add(c["label"])
                         unique_names.append(c["label"])
                 names = ", ".join(f'"{n}"' for n in unique_names[:3])
-                state["clarification_needed"] = True
-                state["clarification_question"] = (
-                    f"I found a low-confidence match for your indicator. Did you mean one of: {names}? "
-                    f"Please rephrase your question with the exact indicator name."
-                )
                 logger.info(
-                    "disambiguation_triggered",
+                    "auto_resolved_disambiguation",
                     extra={"low_confidence_metrics": labels, "candidates": names},
                 )
             else:
-                state["clarification_needed"] = True
-                missing_labels = ", ".join(labels) or "the requested indicator"
-                state["clarification_question"] = (
-                    f"I couldn't find any health indicators matching '{missing_labels}' in this DHIS2 instance. "
-                    f"Could you verify the indicator name and try again?"
-                )
-                logger.info(
-                    "metadata_low_confidence_no_candidates",
+                logger.warning(
+                    "metadata_low_confidence_no_candidates_proceeding",
                     extra={"low_confidence_metrics": labels},
                 )
 
@@ -148,23 +139,47 @@ async def resolve_metadata(state: AgentState, settings: Settings) -> AgentState:
                 )
             else:
                 # Index reachable but no match for an explicitly named location.
-                # Ask the user rather than sending ou:UNRESOLVED to DHIS2 (409)
-                # or silently querying the wrong scope. Metric clarification (if
-                # any) takes precedence — don't overwrite it.
+                # Do not block with a clarification. Let the analytics builder fall back to USER_ORGUNIT.
                 logger.warning(
-                    "org_unit_not_found",
+                    "org_unit_not_found_proceeding",
                     extra={"label": org_label, "using_placeholder": org_uid},
                 )
-                if not state.get("clarification_needed"):
-                    state["clarification_needed"] = True
-                    state["clarification_question"] = (
-                        f"I couldn't find a location named '{org_label}' in this DHIS2 instance. "
-                        f"Could you check the spelling, or try a broader area?"
-                    )
         except Exception as exc:
             # Infra failure — leave the org unit as-is and let the analytics
+            # infra failure — leave the org unit as-is and let the analytics
             # builder fall back to USER_ORGUNIT; do not block with a clarification.
             logger.warning("org_unit_resolve_failed", extra={"label": org_label, "error": str(exc)})
+
+    # --- Disaggregation resolution ---
+    resolved_disaggregations = []
+    for d in (state.get("disaggregations") or []):
+        if d == "ou_children":
+            resolved_disaggregations.append(d)
+        else:
+            # It's a demographic category string
+            from backend.app.db.metadata_index import search_category_by_name
+            from backend.app.db.session import get_db_session
+            
+            cat_resolved = None
+            if settings.is_postgres and settings.embedding_provider != "mock":
+                cat_resolved = await _pgvector_resolve_category(d, settings)
+                
+            if not cat_resolved:
+                try:
+                    async with get_db_session() as session:
+                        results = await search_category_by_name(session, d, is_postgres=settings.is_postgres, limit=1)
+                        if results and results[0].get("uid_confidence", 0) >= settings.metadata_confidence_threshold:
+                            cat_resolved = {"uid": results[0]["uid"], "label": results[0]["label"]}
+                except Exception as exc:
+                    logger.warning("category_resolve_failed", extra={"term": d, "error": str(exc)})
+
+            if cat_resolved:
+                resolved_disaggregations.append(cat_resolved["uid"])
+                logger.info("category_resolved", extra={"term": d, "uid": cat_resolved["uid"], "label": cat_resolved["label"]})
+            else:
+                logger.warning("category_not_found", extra={"term": d})
+                
+    state["disaggregations"] = resolved_disaggregations
 
     duration = time.time() - start_time
     logger.info(
@@ -365,3 +380,39 @@ async def _keyword_candidates_from_db(query: str, settings: Settings) -> list[di
     except Exception as exc:
         logger.warning("keyword_candidates_db_failed", extra={"error": str(exc)})
         return []
+
+async def _pgvector_resolve_category(
+    term: str,
+    settings: Settings,
+) -> dict | None:
+    """Query pgvector for a category match."""
+    from backend.app.llm import embed
+    from backend.app.db.session import get_db_session
+    from sqlalchemy import text as sa_text
+
+    try:
+        async with get_db_session() as session:
+            embedding = await embed(term, settings)
+            if not embedding:
+                return None
+
+            result = await session.execute(
+                sa_text("""
+                SELECT uid, name, object_type, 1 - (embedding <=> CAST(:emb AS vector)) AS similarity
+                FROM metadata_index
+                WHERE embedding IS NOT NULL
+                  AND object_type = 'category'
+                ORDER BY embedding <=> CAST(:emb AS vector)
+                LIMIT 1
+                """),
+                {"emb": str(embedding)},
+            )
+            row = result.fetchone()
+            if row and float(row[3]) >= settings.metadata_confidence_threshold:
+                return {
+                    "uid": row[0],
+                    "label": row[1],
+                }
+    except Exception as exc:
+        logger.warning("pgvector_resolve_category_failed", extra={"term": term, "error": str(exc)})
+    return None

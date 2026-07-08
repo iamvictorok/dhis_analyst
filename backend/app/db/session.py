@@ -171,17 +171,17 @@ async def init_db() -> None:
                     logger.warning("db_timestamp_migration_skipped", extra={"table": tbl, "column": col, "error": str(exc)})
             logger.info("db_init_postgres_complete")
         else:
-            # SQLite schema (no vector support)
+            # SQLite schema (no vector support) - using FTS5 for local-first resilience
             await conn.execute(text("""
-                CREATE TABLE IF NOT EXISTS metadata_index_lite (
-                    uid TEXT PRIMARY KEY,
-                    object_type TEXT NOT NULL,
-                    name TEXT NOT NULL,
-                    short_name TEXT,
-                    description TEXT,
-                    dataset_names TEXT,
-                    raw_metadata TEXT,
-                    last_synced_at TEXT
+                CREATE VIRTUAL TABLE IF NOT EXISTS metadata_index_fts USING fts5(
+                    uid UNINDEXED,
+                    object_type UNINDEXED,
+                    name,
+                    short_name,
+                    description,
+                    dataset_names,
+                    raw_metadata UNINDEXED,
+                    last_synced_at UNINDEXED
                 )
             """))
             # Conversation history (SQLite)

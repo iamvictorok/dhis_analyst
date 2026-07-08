@@ -26,6 +26,7 @@ SYNC_ENDPOINTS = [
     ("indicators", "indicator", "id,name,shortName,description"),
     ("organisationUnits", "orgUnit", "id,name,shortName,level"),
     ("programIndicators", "programIndicator", "id,name,shortName,description"),
+    ("categories", "category", "id,name,shortName,description"),
 ]
 
 
@@ -215,9 +216,15 @@ async def _upsert_sqlite(
     from backend.app.db.session import get_db_session
 
     async with get_db_session() as session:
+        # FTS5 does not support INSERT OR REPLACE on a custom column like uid.
+        # So we delete first, then insert.
+        await session.execute(
+            text("DELETE FROM metadata_index_fts WHERE uid = :uid"),
+            {"uid": uid}
+        )
         await session.execute(
             text("""
-            INSERT OR REPLACE INTO metadata_index_lite
+            INSERT INTO metadata_index_fts
             (uid, object_type, name, short_name, description, dataset_names, raw_metadata, last_synced_at)
             VALUES (:uid, :ot, :name, :sn, :desc, :dsn, :raw, :ts)
             """),

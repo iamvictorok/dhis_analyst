@@ -65,14 +65,17 @@ def build_analytics_params(state: AgentState) -> dict[str, Any]:
         "outputIdScheme": "NAME",
         "skipMeta": "false",
     }
-    # Only append a category-option-combo dimension for real COC UIDs. Free-text
-    # tokens the LLM may emit ("sex", "age") are not valid co items and 409.
-    co_items = [d for d in disaggregations if DHIS2_UID_RE.match(d)]
+    # Append valid category UIDs as dimensions. Free-text
+    # tokens that failed to resolve in metadata_resolve are dropped to avoid 409s.
+    category_uids = [d for d in disaggregations if DHIS2_UID_RE.match(d)]
     dropped = [d for d in disaggregations if not DHIS2_UID_RE.match(d)]
     if dropped:
         logger.warning("analytics_dropped_invalid_disaggregations", extra={"tokens": dropped})
-    if co_items:
-        params["dimension"].append(f"co:{_join_dimension_items(co_items)}")
+    
+    # Each category UID must be appended as its own dimension (e.g. dimension=sex12345678)
+    for cat_uid in category_uids:
+        params["dimension"].append(cat_uid)
+        
     logger.info("build_analytics_params_complete", extra={"params": params})
     return params
 

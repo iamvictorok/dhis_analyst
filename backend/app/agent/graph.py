@@ -11,6 +11,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import re
 import time
 import uuid
 from collections.abc import AsyncIterator
@@ -102,6 +103,7 @@ async def build_initial_state(
         "clarification_needed": intent["clarification_needed"],
         "clarification_question": intent["clarification_question"],
         "requires_data": intent.get("requires_data", True),
+        "query_expansion": intent.get("query_expansion", ""),
         "dhis2_data": {},
         "pii_map": {},
         "web_context": [],
@@ -185,6 +187,7 @@ async def run_agent_stream(
             else:
                 error_msg = str(exc)
             is_period_error = "409" in error_msg and "period" in error_msg.lower()
+            is_dimension_error = "409" in error_msg and ("dimension" in error_msg.lower() or "aggregation" in error_msg.lower())
 
             if is_period_error:
                 # Retry with a safe fallback period
@@ -205,6 +208,45 @@ async def run_agent_stream(
                     yield sse("error", {
                         "code": "DATA_FETCH_FAILED",
                         "user_message": f"Could not retrieve DHIS2 data even with fallback period: {friendly_error}",
+                        "detail": str(retry_exc),
+                    })
+                    # Non-fatal — continue with empty data
+            elif is_dimension_error and (state.get("disaggregations") or len(state.get("metrics", [])) > 1):
+                logger.warning(
+                    "fetch_dhis2_dimension_retry",
+                    extra={
+                        "original_disaggregations": state.get("disaggregations"),
+                        "original_metrics_count": len(state.get("metrics", [])),
+                        "error": error_msg,
+                    }
+                )
+                # First try to regex out the exact failing UID from the error
+                uid_match = re.search(r"\b[a-zA-Z][a-zA-Z0-9]{10}\b", error_msg)
+                stripped_uid = False
+                if uid_match:
+                    failing_uid = uid_match.group(0)
+                    metrics = state.get("metrics", [])
+                    if any(m.get("uid") == failing_uid for m in metrics):
+                        state["metrics"] = [m for m in metrics if m.get("uid") != failing_uid]
+                        stripped_uid = True
+                        logger.info("precision_self_healing_dropped_uid", extra={"uid": failing_uid})
+                        
+                if not stripped_uid:
+                    # First try stripping disaggregations (e.g. ou_children causing 409s)
+                    state["disaggregations"] = []
+                    # And trim metrics to the safest top hit
+                    if state.get("metrics"):
+                        state["metrics"] = state["metrics"][:1]
+                
+                try:
+                    state = await _timed_node("fetch_dhis2_retry", fetch_dhis2, state, settings)
+                except Exception as retry_exc:
+                    logger.error("fetch_dhis2_retry_failed", extra={"error": str(retry_exc)})
+                    friendly_error = _user_friendly_error(str(retry_exc))
+                    state["fetch_error"] = friendly_error
+                    yield sse("error", {
+                        "code": "DATA_FETCH_FAILED",
+                        "user_message": f"Could not retrieve DHIS2 data even after falling back to a safer query: {friendly_error}",
                         "detail": str(retry_exc),
                     })
                     # Non-fatal — continue with empty data
@@ -250,6 +292,12 @@ async def run_agent_stream(
     # --- Empty data guard: refuse to hallucinate from nothing ---
     if state["requires_data"] and not state.get("dhis2_data", {}).get("rows"):
         mode = state["output_mode"]
+        
+        if state.get("fetch_error"):
+            logger.info("agent_done_fetch_error", extra={"session_id": state["session_id"], "mode": mode})
+            yield sse("done")
+            return
+            
         if mode in ("report", "dashboard", "presentation", "export", "map"):
             yield sse("report_html", {"html": _no_data_html(state)})
             logger.info("agent_done_no_data", extra={"session_id": state["session_id"], "mode": mode})
@@ -332,6 +380,8 @@ def _user_friendly_error(error_msg: str) -> str:
         return "The DHIS2 server encountered an internal error."
     if "ConnectError" in error_msg or "timeout" in error_msg.lower():
         return "Could not connect to the DHIS2 server."
+    if "metadata resolution succeeds" in error_msg:
+        return "I couldn't fetch the specific records because the health indicator or location couldn't be definitively matched in the DHIS2 database."
     return "An unexpected error occurred while fetching data."
 
 

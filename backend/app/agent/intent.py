@@ -210,6 +210,7 @@ Output mode — use ONE of:
 
 Return JSON with these exact keys:
 {{
+  "query_expansion": "<think step-by-step: expand layperson terms to medical/public health terms, e.g. shots->vaccinations, pregnant->ANC. Briefly state your reasoning>",
   "output_mode": "<one of the 6 modes>",
   "requires_data": <true/false>,
   "metrics": [{{"label": "<indicator name>", "uid": null, "object_type": "indicator"}}],
@@ -224,8 +225,42 @@ Return JSON with these exact keys:
 }}
 
 requires_data: set to true when the query needs DHIS2 data retrieval (e.g. health statistics, trends, comparisons, reports, exports). Set to false for casual chitchat, greetings, thank-yous, general knowledge questions, or meta-questions about the system that do NOT need health data from DHIS2.
-disaggregations: If the user explicitly asks to break down data spatially (e.g., "across all districts", "by region", "compare clinics"), include "ou_children". Otherwise leave it empty []. For time trends, use relative period codes (e.g. MONTHS_THIS_YEAR) instead of disaggregations.
+disaggregations: If the user explicitly asks to break down data spatially (e.g., "across all districts", "by region"), include "ou_children". If they ask for demographic/category breakdowns (e.g. "by age", "by gender", "by facility type"), include those layperson terms as strings (e.g. ["age", "gender"]). Otherwise leave it empty []. For time trends, use relative period codes (e.g. MONTHS_THIS_YEAR) instead of disaggregations.
 data_retrieval_strategy: Use "tracker_api" ONLY if the user explicitly asks for line lists, individual patient records, specific patient events, or un-aggregated dates (e.g., "date of previous malaria episode"). Use "data_value_sets" ONLY if the user explicitly asks for raw data validation, missing reports, or data entry errors before aggregation. Otherwise, always use "analytics_api" for aggregated totals, summaries, and percentages.
+clarification_needed: Set to true ONLY IF the query is completely nonsensical or utterly lacks a health subject. NEVER ask for clarification about DHIS2 specifics, metadata, exact indicator names, or periods. Always make your best guess and map the user's natural language to the closest logical structure.
+
+Few-Shot Examples:
+1. User: "How many kids got their shots in Bo last year?"
+{{
+  "query_expansion": "User asks for 'shots' in 'Bo' for 'last year'. Shots implies immunizations or vaccinations like Penta or OPV.",
+  "output_mode": "conversational",
+  "requires_data": true,
+  "metrics": [{{"label": "Immunization coverage", "uid": null, "object_type": "indicator"}}],
+  "org_unit_label": "Bo",
+  "periods": ["LAST_YEAR"],
+  "disaggregations": [],
+  "data_retrieval_strategy": "analytics_api",
+  "needs_web_enrichment": false,
+  "web_search_queries": [],
+  "clarification_needed": false,
+  "clarification_question": null
+}}
+
+2. User: "Give me a dashboard of malaria deaths across all districts for the last 4 quarters."
+{{
+  "query_expansion": "User asks for 'malaria deaths' 'across all districts' for 'last 4 quarters'. Needs dashboard mode and spatial disaggregation.",
+  "output_mode": "dashboard",
+  "requires_data": true,
+  "metrics": [{{"label": "Malaria mortality rate", "uid": null, "object_type": "indicator"}}],
+  "org_unit_label": "National",
+  "periods": ["LAST_4_QUARTERS"],
+  "disaggregations": ["ou_children"],
+  "data_retrieval_strategy": "analytics_api",
+  "needs_web_enrichment": false,
+  "web_search_queries": [],
+  "clarification_needed": false,
+  "clarification_question": null
+}}
 
 Period codes — use ONE of:
 1. Fixed periods: quarterly=YYYYQn, annual=YYYY, weekly=YYYYWww, monthly=YYYYMM.
@@ -245,11 +280,11 @@ Web enrichment: true for WHO guidelines, benchmarks, outbreak context, policy, e
 """
 
     llm_messages = [{"role": "system", "content": system}]
-    # Pass full conversation history for accurate follow-up understanding
+    # Pass limited conversation history for accurate follow-up without token bloat
     if history:
-        for msg in history:
-            llm_messages.append({"role": msg["role"], "content": msg["content"]})
-    llm_messages.append({"role": "user", "content": message})
+        for msg in history[-5:]:
+            llm_messages.append({"role": msg["role"], "content": _scrub_pii(msg["content"])})
+    llm_messages.append({"role": "user", "content": _scrub_pii(message)})
 
     try:
         raw = await complete(
@@ -294,6 +329,18 @@ Web enrichment: true for WHO guidelines, benchmarks, outbreak context, policy, e
 # ---------------------------------------------------------------------------
 # Internal helpers
 # ---------------------------------------------------------------------------
+
+def _scrub_pii(text: str) -> str:
+    """Lightweight PII scrubber to protect patient data from reaching the LLM."""
+    if not text:
+        return text
+    # Scrub potential patient IDs / names / DOBs
+    text = re.sub(r"\b(?:patient\s+)?(?:id|dob|dob[:\s])\s*[\w-]+\b", "[REDACTED_PII]", text, flags=re.I)
+    # Scrub anything that looks like a date of birth context
+    text = re.sub(r"\b(?:born on|date of birth)\s+[\d/:-]+\b", "[REDACTED_DATE]", text, flags=re.I)
+    # Scrub specific names following 'patient' or 'person'
+    text = re.sub(r"\b(patient|person)\s+([A-Z][a-z]+\s+[A-Z][a-z]+)\b", r"\1 [REDACTED_NAME]", text)
+    return text
 
 def _detect_output_mode(text: str) -> OutputMode:
     if any(w in text for w in ("slide", "presentation", "briefing deck", "pptx")):
@@ -559,6 +606,7 @@ def _merge_llm_intent(
         strategy = "analytics_api"
 
     return {
+        "query_expansion": parsed.get("query_expansion", ""),
         "output_mode": output_mode,
         "requires_data": bool(parsed.get("requires_data", True)),
         "metrics": metrics,

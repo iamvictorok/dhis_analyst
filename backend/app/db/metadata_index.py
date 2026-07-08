@@ -62,22 +62,17 @@ async def search_by_keyword(
     """Search metadata by keyword match (SQLite compatible)."""
     from sqlalchemy import text
 
-    pattern = f"%{_escape_like(term)}%"
+    # Escape quotes for FTS match
+    clean_term = term.replace('"', '""')
     result = await session.execute(
         text(r"""
             SELECT uid, name, object_type, short_name, description
-            FROM metadata_index_lite
-            WHERE name LIKE :pattern ESCAPE '\'
-               OR short_name LIKE :pattern ESCAPE '\'
-               OR description LIKE :pattern ESCAPE '\'
-               OR dataset_names LIKE :pattern ESCAPE '\'
-            ORDER BY
-                CASE WHEN LOWER(name) = LOWER(:term) THEN 0 ELSE 1 END,
-                LENGTH(name),
-                uid
+            FROM metadata_index_fts
+            WHERE metadata_index_fts MATCH :term
+            ORDER BY rank
             LIMIT :lim
         """),
-        {"pattern": pattern, "term": term, "lim": limit},
+        {"term": f'"{clean_term}"*', "lim": limit},
     )
     return [
         {
@@ -109,7 +104,7 @@ async def search_org_unit_by_name(
     import json
     from sqlalchemy import text
 
-    table = "metadata_index" if is_postgres else "metadata_index_lite"
+    table = "metadata_index" if is_postgres else "metadata_index_fts"
 
     def clean_name(n: str) -> str:
         # Strip common qualifiers
@@ -144,20 +139,35 @@ async def search_org_unit_by_name(
         if rows:
             break
 
-        # 2. Fall back to LIKE pattern match (shortest/most-specific name first)
-        pattern = f"%{_escape_like(term)}%"
-        result = await session.execute(
-            text(rf"""
-                SELECT uid, name, short_name, raw_metadata
-                FROM {table}
-                WHERE object_type = 'orgUnit'
-                  AND (LOWER(name) LIKE LOWER(:pattern) ESCAPE '\'
-                       OR LOWER(short_name) LIKE LOWER(:pattern) ESCAPE '\')
-                ORDER BY LENGTH(name), uid
-                LIMIT :lim
-            """),
-            {"pattern": pattern, "lim": limit},
-        )
+        # 2. Fall back to pattern match (shortest/most-specific name first)
+        if is_postgres:
+            pattern = f"%{_escape_like(term)}%"
+            result = await session.execute(
+                text(rf"""
+                    SELECT uid, name, short_name, raw_metadata
+                    FROM {table}
+                    WHERE object_type = 'orgUnit'
+                      AND (LOWER(name) LIKE LOWER(:pattern) ESCAPE '\'
+                           OR LOWER(short_name) LIKE LOWER(:pattern) ESCAPE '\')
+                    ORDER BY LENGTH(name), uid
+                    LIMIT :lim
+                """),
+                {"pattern": pattern, "lim": limit},
+            )
+        else:
+            clean_term = term.replace('"', '""')
+            match_term = f'"{clean_term}"*'
+            result = await session.execute(
+                text(rf"""
+                    SELECT uid, name, short_name, raw_metadata
+                    FROM {table}
+                    WHERE object_type = 'orgUnit'
+                      AND metadata_index_fts MATCH :match_term
+                    ORDER BY rank, LENGTH(name), uid
+                    LIMIT :lim
+                """),
+                {"match_term": match_term, "lim": limit},
+            )
         rows = result.fetchall()
         if rows:
             break
@@ -195,7 +205,7 @@ async def search_indicator_by_name(
     import re
     from sqlalchemy import text
 
-    table = "metadata_index" if is_postgres else "metadata_index_lite"
+    table = "metadata_index" if is_postgres else "metadata_index_fts"
 
     # Clean common qualifiers that might mismatch
     def clean_label(n: str) -> str:
@@ -232,22 +242,37 @@ async def search_indicator_by_name(
             matched_exact = True
             break
 
-        # 2. LIKE pattern match — shortest (most specific) name first, with uid
+        # 2. LIKE pattern match / MATCH — shortest (most specific) name first, with uid
         # as a stable tiebreaker so the same query resolves the same way across
         # syncs (previously order was unspecified → nondeterministic UID).
-        pattern = f"%{_escape_like(term)}%"
-        result = await session.execute(
-            text(rf"""
-                SELECT uid, name, object_type, short_name, description
-                FROM {table}
-                WHERE object_type IN ('indicator', 'dataElement', 'programIndicator')
-                  AND (LOWER(name) LIKE LOWER(:pattern) ESCAPE '\'
-                       OR LOWER(short_name) LIKE LOWER(:pattern) ESCAPE '\')
-                ORDER BY LENGTH(name), uid
-                LIMIT :lim
-            """),
-            {"pattern": pattern, "lim": limit},
-        )
+        if is_postgres:
+            pattern = f"%{_escape_like(term)}%"
+            result = await session.execute(
+                text(rf"""
+                    SELECT uid, name, object_type, short_name, description
+                    FROM {table}
+                    WHERE object_type IN ('indicator', 'dataElement', 'programIndicator')
+                      AND (LOWER(name) LIKE LOWER(:pattern) ESCAPE '\'
+                           OR LOWER(short_name) LIKE LOWER(:pattern) ESCAPE '\')
+                    ORDER BY LENGTH(name), uid
+                    LIMIT :lim
+                """),
+                {"pattern": pattern, "lim": limit},
+            )
+        else:
+            clean_term = term.replace('"', '""')
+            match_term = f'"{clean_term}"*'
+            result = await session.execute(
+                text(rf"""
+                    SELECT uid, name, object_type, short_name, description
+                    FROM {table}
+                    WHERE object_type IN ('indicator', 'dataElement', 'programIndicator')
+                      AND metadata_index_fts MATCH :match_term
+                    ORDER BY rank, LENGTH(name), uid
+                    LIMIT :lim
+                """),
+                {"match_term": match_term, "lim": limit},
+            )
         rows = result.fetchall()
         if rows:
             break
@@ -273,3 +298,94 @@ async def search_indicator_by_name(
             "uid_confidence": confidence,
         })
     return results
+
+
+async def search_category_by_name(
+    session,
+    name: str,
+    *,
+    is_postgres: bool = False,
+    limit: int = 3,
+) -> list[dict[str, Any]]:
+    """Search categories by name in the synced metadata index.
+    
+    Tries exact match first, then LIKE. Works with both Postgres and SQLite.
+    """
+    from sqlalchemy import text
+
+    table = "metadata_index" if is_postgres else "metadata_index_fts"
+
+    search_terms = [name]
+
+    rows = []
+    matched_exact = False
+    for term in search_terms:
+        # 1. Exact case-insensitive match
+        result = await session.execute(
+            text(f"""
+                SELECT uid, name, object_type, short_name, description
+                FROM {table}
+                WHERE object_type = 'category'
+                  AND LOWER(name) = LOWER(:name)
+                ORDER BY LENGTH(name), uid
+                LIMIT :lim
+            """),
+            {"name": term, "lim": limit},
+        )
+        rows = result.fetchall()
+        if rows:
+            matched_exact = True
+            break
+
+        # 2. LIKE pattern match / MATCH
+        if is_postgres:
+            pattern = f"%{_escape_like(term)}%"
+            result = await session.execute(
+                text(rf"""
+                    SELECT uid, name, object_type, short_name, description
+                    FROM {table}
+                    WHERE object_type = 'category'
+                      AND (LOWER(name) LIKE LOWER(:pattern) ESCAPE '\'
+                           OR LOWER(short_name) LIKE LOWER(:pattern) ESCAPE '\')
+                    ORDER BY LENGTH(name), uid
+                    LIMIT :lim
+                """),
+                {"pattern": pattern, "lim": limit},
+            )
+        else:
+            clean_term = term.replace('"', '""')
+            match_term = f'"{clean_term}"*'
+            result = await session.execute(
+                text(rf"""
+                    SELECT uid, name, object_type, short_name, description
+                    FROM {table}
+                    WHERE object_type = 'category'
+                      AND metadata_index_fts MATCH :match_term
+                    ORDER BY rank, LENGTH(name), uid
+                    LIMIT :lim
+                """),
+                {"match_term": match_term, "lim": limit},
+            )
+        rows = result.fetchall()
+        if rows:
+            break
+
+    results = []
+    for row in rows:
+        exact_name = row[1].lower() == name.lower()
+        if exact_name:
+            confidence = 0.95
+        elif matched_exact:
+            confidence = 0.85
+        else:
+            confidence = 0.65
+        results.append({
+            "uid": row[0],
+            "label": row[1],
+            "object_type": row[2],
+            "short_name": row[3],
+            "description": row[4],
+            "uid_confidence": confidence,
+        })
+    return results
+

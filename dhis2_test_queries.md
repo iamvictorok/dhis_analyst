@@ -36,6 +36,12 @@ Use this guide to test every single capability, output mode, and API routing str
 *Tests the `map` output mode and the HTML GeoJSON rendering engine.*
 - "Show me a heat map of Malaria cases across all districts this year."
 - "Can you plot the geographical distribution of HIV testing in Bo?"
+
+## 7. Demographic & Category Disaggregations (Phase 5)
+*Tests the `metadata_resolve` category resolution and `analytics` API dimension building.*
+- "Show me Malaria cases by age group and gender in Bo for the last 6 months."
+- "Compare HIV testing by facility type across all districts."
+- "Give me a breakdown of maternal mortality by age."
 - "Generate a map showing the Covid-19 spread across the national level."
 
 ## 7. Ambiguity & Clarification Handling
