@@ -191,6 +191,19 @@ class DHIS2Client:
             except httpx.HTTPStatusError as exc:
                 body = exc.response.text[:500]
                 is_html = "<html" in body.lower() or "<!doctype" in body.lower()
+
+                # Extract structured error message from DHIS2 JSON error responses
+                dhis2_error_msg = ""
+                if not is_html and exc.response.status_code in {409, 400}:
+                    try:
+                        err_json = exc.response.json()
+                        dhis2_error_msg = err_json.get("message", "")
+                        if not dhis2_error_msg:
+                            # Some DHIS2 versions nest the message differently
+                            dhis2_error_msg = err_json.get("status", "")
+                    except Exception:
+                        pass
+
                 if is_html and exc.response.status_code == 404:
                     logger.error(
                         "dhis2_base_url_wrong: Got HTML 404 from nginx — "
@@ -205,12 +218,14 @@ class DHIS2Client:
                     )
                 else:
                     logger.error(
-                        f"dhis2_http_error: HTTP {exc.response.status_code} - {body}",
+                        f"dhis2_http_error: HTTP {exc.response.status_code} - "
+                        f"{dhis2_error_msg or body}",
                         extra={
                             "path": path,
                             "full_url": f"{self._base_url}{path}",
                             "params_shape": _params_shape(params),
                             "status": exc.response.status_code,
+                            "dhis2_message": dhis2_error_msg,
                             "duration_ms": int((time.monotonic() - start) * 1000),
                         },
                     )

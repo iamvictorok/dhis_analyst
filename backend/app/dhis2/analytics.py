@@ -25,7 +25,19 @@ def build_analytics_params(state: AgentState) -> dict[str, Any]:
             "periods": state.get("periods"),
         }
     )
-    dx_items = [m["uid"] for m in state["metrics"] if m.get("uid")]
+    # Filter out UNRESOLVED and empty UIDs — sending them to DHIS2 causes
+    # cryptic 409 errors ("dimension is present without valid options").
+    dx_items = [
+        m["uid"] for m in state["metrics"]
+        if m.get("uid") and m["uid"] != "UNRESOLVED" and DHIS2_UID_RE.match(m["uid"])
+    ]
+    if not dx_items:
+        resolved_labels = [m.get("label", "?") for m in state["metrics"]]
+        raise ValueError(
+            f"No indicators could be resolved to valid DHIS2 UIDs. "
+            f"The search terms ({', '.join(resolved_labels)}) did not match any "
+            f"indicator in this DHIS2 instance. Please try different wording."
+        )
     dx = _join_dimension_items(dx_items)
     
     ou_level = state["org_unit"]["level"]

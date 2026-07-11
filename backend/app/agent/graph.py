@@ -93,6 +93,7 @@ async def build_initial_state(
         "user_role": identity.role,
         "output_mode": intent["output_mode"],
         "metrics": intent["metrics"],
+        "metric_search_terms": intent.get("metric_search_terms", []),
         "org_unit": intent["org_unit"],
         "periods": intent["periods"],
         "disaggregations": intent["disaggregations"],
@@ -175,6 +176,30 @@ async def run_agent_stream(
 
         if state["clarification_needed"]:
             yield sse("clarification", {"question": state["clarification_question"]})
+            yield sse("done")
+            return
+
+        # --- Pre-flight: check for UNRESOLVED metrics ---
+        unresolved = [
+            m for m in state["metrics"]
+            if m.get("uid") == "UNRESOLVED" or not m.get("uid")
+        ]
+        if unresolved and len(unresolved) == len(state["metrics"]):
+            labels = [m.get("label", "?") for m in unresolved]
+            logger.warning(
+                "all_metrics_unresolved",
+                extra={"labels": labels, "session_id": state["session_id"]},
+            )
+            friendly = (
+                f"I couldn't find any health indicators matching your request "
+                f"({', '.join(labels)}) in this DHIS2 instance. "
+                f"Try using more specific health terminology (e.g. 'Malaria confirmed cases', "
+                f"'ANC 1st visit', 'OPV3 doses given')."
+            )
+            yield sse("error", {
+                "code": "INDICATORS_NOT_FOUND",
+                "user_message": friendly,
+            })
             yield sse("done")
             return
 
@@ -267,6 +292,7 @@ async def run_agent_stream(
                     "code": "DATA_FETCH_FAILED",
                     "user_message": f"Could not retrieve DHIS2 data: {friendly_error}",
                     "detail": error_msg,
+                    "suggestion": "Try rephrasing your request with different indicator names.",
                 })
                 # Non-fatal — continue with empty data
 
@@ -369,9 +395,13 @@ def _user_friendly_error(error_msg: str) -> str:
     if "409" in error_msg and "referenced table does not exist" in error_msg.lower():
         return "The analytics tables for this data have not been generated in DHIS2. Please ensure the DHIS2 analytics export job has been run."
     if "409" in error_msg and "dimension is present" in error_msg.lower():
-        return "The query was constructed with a dimension that has no valid options. This usually means the health indicator could not be correctly identified in the DHIS2 instance."
+        return "The health indicator could not be correctly identified in the DHIS2 instance. Try rephrasing with more specific terminology (e.g. 'Malaria confirmed cases' instead of 'malaria')."
     if "409" in error_msg and "period" in error_msg.lower():
         return "The requested time period was not recognized by DHIS2."
+    if "No indicators could be resolved" in error_msg:
+        return error_msg  # Already user-friendly from our pre-flight check
+    if "metadata resolution succeeds" in error_msg:
+        return "The health indicator or location couldn't be definitively matched in the DHIS2 database. Try using more specific names."
     if "404" in error_msg:
         return "The requested resource was not found on the DHIS2 server."
     if "401" in error_msg or "403" in error_msg:
@@ -380,8 +410,6 @@ def _user_friendly_error(error_msg: str) -> str:
         return "The DHIS2 server encountered an internal error."
     if "ConnectError" in error_msg or "timeout" in error_msg.lower():
         return "Could not connect to the DHIS2 server."
-    if "metadata resolution succeeds" in error_msg:
-        return "I couldn't fetch the specific records because the health indicator or location couldn't be definitively matched in the DHIS2 database."
     return "An unexpected error occurred while fetching data."
 
 

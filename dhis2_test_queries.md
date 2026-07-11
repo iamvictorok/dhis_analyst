@@ -65,3 +65,14 @@ Use this guide to test every single capability, output mode, and API routing str
 - **Step 1:** "Show me the trend of Malaria cases in Bo for last year."
 - **Step 2:** "What about for this year?"
 - **Step 3:** "Change the location to Kenema."
+
+
+
+
+
+Query	Tests
+"Show me Malaria confirmed cases in Bo for the last 6 months"	Token-AND search, exact indicator
+"How many kids got their shots in Bo last year?"	Synonym expansion (shots→immunization), layperson language
+"Compare ANC 1st visit and ANC 4th or more visits in Kenema"	Multi-metric, exact-ish indicator names
+"Hello! Who are you?"	Chitchat bypass (no data pipeline)
+"Give me malaria deaths across all districts"	Synonym + ou_children disaggregation

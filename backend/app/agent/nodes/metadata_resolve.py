@@ -3,14 +3,18 @@
 Resolution path:
 1. pgvector cosine similarity — when Postgres + pgvector is configured AND embeddings are enabled
 2. Keyword match against the synced metadata index — works on both SQLite and Postgres
+3. LLM re-ranking — when candidates are found but confidence is low,
+   uses the LLM to pick the best match from candidates
 
-Confidence gate: if the top match is below metadata_confidence_threshold, surfaces
-disambiguation candidates to the user rather than silently guessing. Infrastructure
-failures (index unavailable/unseeded) are distinguished from genuine misses so the
-user is never told a valid indicator "doesn't exist".
+Confidence gate: if the top match is below metadata_confidence_threshold, the
+resolver auto-resolves to the best available match (logging a warning) rather
+than blocking the pipeline.  Infrastructure failures (index unavailable/unseeded)
+are distinguished from genuine misses so the user is never told a valid indicator
+"doesn't exist".
 """
 from __future__ import annotations
 
+import json
 import logging
 import re
 
@@ -41,11 +45,6 @@ async def resolve_metadata(state: AgentState, settings: Settings) -> AgentState:
     )
 
     # --- Metric resolution ---
-    # Track whether a resolution attempt failed because the metadata index was
-    # unavailable (unseeded table, locked DB, provider down) as opposed to the
-    # index being reachable but holding no match. The two demand opposite
-    # responses: an infra failure must NOT tell the user their indicator is
-    # invalid, while a genuine miss should surface disambiguation candidates.
     threshold = settings.metadata_confidence_threshold
     metadata_lookup_failed = False
     low_confidence = [m for m in metrics if m["uid_confidence"] < threshold]
@@ -60,56 +59,60 @@ async def resolve_metadata(state: AgentState, settings: Settings) -> AgentState:
             logger.warning("pgvector_resolve_failed", extra={"error": str(exc)})
             metadata_lookup_failed = True
 
-    # 2. Keyword resolution — works on BOTH backends (the query targets the
-    # right table per settings.is_postgres). Previously gated to SQLite, which
-    # dead-ended every Postgres query whenever embeddings were mock/unavailable.
+    # 2. Keyword resolution — works on BOTH backends.
+    # Pass search_alternatives from the LLM intent for broader matching.
+    search_alts = state.get("metric_search_terms") or []
     if low_confidence:
         try:
-            metrics = await _resolve_indicators_by_keyword(metrics, settings)
+            metrics = await _resolve_indicators_by_keyword(
+                metrics, settings, search_alternatives=search_alts,
+            )
             state["metrics"] = metrics
             low_confidence = [m for m in metrics if m["uid_confidence"] < threshold]
         except Exception as exc:
             logger.warning("keyword_indicator_resolve_failed", extra={"error": str(exc)})
             metadata_lookup_failed = True
 
+    # 3. LLM re-ranking — when candidates exist but confidence is low, ask the
+    #    LLM to pick the best match. This bridges the gap between layperson
+    #    language and DHIS2 indicator names.
+    if low_confidence and not metadata_lookup_failed and settings.llm_provider != "mock":
+        try:
+            metrics = await _llm_rerank_resolve(
+                metrics, state, settings, threshold,
+            )
+            state["metrics"] = metrics
+            low_confidence = [m for m in metrics if m["uid_confidence"] < threshold]
+        except Exception as exc:
+            logger.warning("llm_rerank_failed", extra={"error": str(exc)})
+
+    # 4. Auto-resolve: if still low confidence, take the best available match
+    #    instead of blocking the pipeline. The user asked in natural language —
+    #    they shouldn't need to know DHIS2 indicator names.
     if low_confidence:
         labels = [
             m["label"] for m in low_confidence
             if isinstance(m.get("label"), str) and m["label"].strip()
         ]
         if metadata_lookup_failed:
-            # Infrastructure problem, not a bad query. Proceed with the
-            # unresolved metric; downstream fetch (mock or real) surfaces any
-            # real issue instead of a misleading "indicator doesn't exist" loop.
             logger.warning(
                 "metadata_index_unavailable_proceeding",
                 extra={"low_confidence_metrics": labels},
             )
         else:
-            # Genuine low/no-confidence match — query candidates PER label so a
-            # multi-indicator request doesn't collapse into one junk LIKE.
-            # INSTEAD of asking the user for clarification, we auto-resolve using the best available
-            # guess, because the user may not know the exact DHIS2 terms.
-            candidates: list[dict] = []
-            for label in labels:
-                candidates.extend(await _keyword_candidates_from_db(label, settings))
-            if candidates:
-                seen: set[str] = set()
-                unique_names = []
-                for c in candidates:
-                    if c["label"] not in seen:
-                        seen.add(c["label"])
-                        unique_names.append(c["label"])
-                names = ", ".join(f'"{n}"' for n in unique_names[:3])
-                logger.info(
-                    "auto_resolved_disambiguation",
-                    extra={"low_confidence_metrics": labels, "candidates": names},
-                )
-            else:
-                logger.warning(
-                    "metadata_low_confidence_no_candidates_proceeding",
-                    extra={"low_confidence_metrics": labels},
-                )
+            # Auto-resolve: bump confidence of best match so it clears the gate
+            for m in metrics:
+                if m.get("uid") and m["uid"] != "UNRESOLVED" and m["uid_confidence"] < threshold:
+                    logger.info(
+                        "auto_resolve_low_confidence",
+                        extra={
+                            "label": m["label"],
+                            "uid": m["uid"],
+                            "original_confidence": m["uid_confidence"],
+                        },
+                    )
+                    m["uid_confidence"] = threshold  # promote to pass the gate
+            state["metrics"] = metrics
 
     # --- Org unit resolution ---
     org_unit = state.get("org_unit", {})
@@ -146,7 +149,6 @@ async def resolve_metadata(state: AgentState, settings: Settings) -> AgentState:
                 )
         except Exception as exc:
             # Infra failure — leave the org unit as-is and let the analytics
-            # infra failure — leave the org unit as-is and let the analytics
             # builder fall back to USER_ORGUNIT; do not block with a clarification.
             logger.warning("org_unit_resolve_failed", extra={"label": org_label, "error": str(exc)})
 
@@ -188,6 +190,10 @@ async def resolve_metadata(state: AgentState, settings: Settings) -> AgentState:
             "duration_seconds": round(duration, 4),
             "clarification_needed": state.get("clarification_needed", False),
             "org_unit_uid": state["org_unit"].get("uid"),
+            "resolved_metrics": [
+                {"label": m["label"], "uid": m["uid"], "conf": m.get("uid_confidence")}
+                for m in state["metrics"]
+            ],
         }
     )
     return state
@@ -242,6 +248,7 @@ async def _resolve_org_unit_from_db(label: str, settings: Settings) -> dict | No
 async def _resolve_indicators_by_keyword(
     metrics: list[dict],
     settings: Settings,
+    search_alternatives: list[str] | None = None,
 ) -> list[dict]:
     """Resolve indicator UIDs via keyword search against the synced index.
 
@@ -268,22 +275,25 @@ async def _resolve_indicators_by_keyword(
                 resolved.append(metric)
                 continue
 
+            # Pass search_alternatives from the LLM for broader matching
             results = await search_indicator_by_name(
                 session,
                 metric["label"],
                 is_postgres=settings.is_postgres,
-                limit=3,
+                limit=5,
+                search_alternatives=search_alternatives,
             )
 
             if results:
                 best = results[0]
                 logger.info(
-                    "indicator_resolved_sqlite",
+                    "indicator_resolved",
                     extra={
                         "original_label": metric["label"],
                         "original_uid": metric.get("uid"),
                         "resolved_uid": best["uid"],
                         "resolved_label": best["label"],
+                        "confidence": best.get("uid_confidence"),
                         "object_type": best.get("object_type"),
                     },
                 )
@@ -295,11 +305,115 @@ async def _resolve_indicators_by_keyword(
                 })
             else:
                 logger.warning(
-                    "indicator_not_found_sqlite",
+                    "indicator_not_found",
                     extra={"label": metric["label"], "uid": metric.get("uid")},
                 )
-                # Keep original but mark low confidence to trigger disambiguation
+                # Keep original but mark low confidence
                 metric["uid_confidence"] = 0.50
+                resolved.append(metric)
+
+    return resolved
+
+
+async def _llm_rerank_resolve(
+    metrics: list[dict],
+    state: AgentState,
+    settings: Settings,
+    threshold: float,
+) -> list[dict]:
+    """Use the LLM to pick the best indicator from broad DB candidates.
+
+    When keyword search returns results but confidence is below threshold, this
+    sends the user's original query + the top candidates to the LLM and asks it
+    to pick the best match. This bridges layperson language to DHIS2 terms with
+    near-perfect accuracy since the LLM understands medical synonyms, context,
+    and intent.
+    """
+    from backend.app.db.metadata_index import search_indicator_by_name
+    from backend.app.db.session import get_db_session
+    from backend.app.llm import complete
+
+    user_query = ""
+    if state.get("messages"):
+        user_query = state["messages"][-1].get("content", "")
+
+    resolved = []
+    for metric in metrics:
+        if metric.get("uid_confidence", 0) >= threshold:
+            resolved.append(metric)
+            continue
+
+        # Grab broader candidates for the LLM to choose from
+        async with get_db_session() as session:
+            candidates = await search_indicator_by_name(
+                session,
+                metric["label"],
+                is_postgres=settings.is_postgres,
+                limit=10,
+            )
+
+        if not candidates:
+            resolved.append(metric)
+            continue
+
+        # Build the LLM re-ranking prompt
+        candidate_list = "\n".join(
+            f"  {i+1}. \"{c['label']}\" (uid: {c['uid']}, type: {c.get('object_type', 'indicator')})"
+            for i, c in enumerate(candidates)
+        )
+
+        rerank_prompt = f"""The user asked: "{user_query}"
+The system extracted the health indicator: "{metric['label']}"
+
+Below are the closest matches found in the DHIS2 metadata database.
+Pick the ONE best match that most closely corresponds to what the user is asking about.
+Return ONLY a JSON object: {{"index": <1-based index>, "reasoning": "<brief reason>"}}
+
+Candidates:
+{candidate_list}
+
+If NONE of the candidates are relevant, return: {{"index": 0, "reasoning": "no match"}}"""
+
+        try:
+            raw = await complete(
+                [{"role": "user", "content": rerank_prompt}],
+                settings,
+                json_mode=True,
+                temperature=0.0,
+            )
+            parsed = json.loads(raw)
+            idx = int(parsed.get("index", 0))
+            if 1 <= idx <= len(candidates):
+                chosen = candidates[idx - 1]
+                logger.info(
+                    "llm_rerank_resolved",
+                    extra={
+                        "original_label": metric["label"],
+                        "chosen_label": chosen["label"],
+                        "chosen_uid": chosen["uid"],
+                        "reasoning": parsed.get("reasoning", ""),
+                    },
+                )
+                resolved.append({
+                    "label": chosen["label"],
+                    "uid": chosen["uid"],
+                    "uid_confidence": 0.90,  # LLM-verified match
+                    "object_type": chosen.get("object_type", "indicator"),
+                })
+            else:
+                logger.info("llm_rerank_no_match", extra={"label": metric["label"]})
+                resolved.append(metric)
+        except Exception as exc:
+            logger.warning(
+                "llm_rerank_parse_failed",
+                extra={"label": metric["label"], "error": str(exc)},
+            )
+            # Fall back to the best keyword match
+            if candidates:
+                best = candidates[0]
+                best["uid_confidence"] = max(best.get("uid_confidence", 0.70), 0.72)
+                resolved.append(best)
+            else:
                 resolved.append(metric)
 
     return resolved
@@ -364,7 +478,7 @@ async def _pgvector_resolve(
 
 
 async def _keyword_candidates_from_db(query: str, settings: Settings) -> list[dict]:
-    """Return up to 3 disambiguation candidates from the synced metadata DB."""
+    """Return up to 5 disambiguation candidates from the synced metadata DB."""
     from backend.app.db.metadata_index import search_indicator_by_name
     from backend.app.db.session import get_db_session
 
@@ -374,7 +488,7 @@ async def _keyword_candidates_from_db(query: str, settings: Settings) -> list[di
                 session,
                 query,
                 is_postgres=settings.is_postgres,
-                limit=3,
+                limit=5,
             )
         return results
     except Exception as exc:

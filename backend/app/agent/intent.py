@@ -213,7 +213,8 @@ Return JSON with these exact keys:
   "query_expansion": "<think step-by-step: expand layperson terms to medical/public health terms, e.g. shots->vaccinations, pregnant->ANC. Briefly state your reasoning>",
   "output_mode": "<one of the 6 modes>",
   "requires_data": <true/false>,
-  "metrics": [{{"label": "<indicator name>", "uid": null, "object_type": "indicator"}}],
+  "metrics": [{{"label": "<indicator name as it might appear in DHIS2>", "uid": null, "object_type": "indicator", "search_terms": ["<alternative search term 1>", "<alternative search term 2>"]}}],
+  "metric_search_terms": ["<additional search strings to try if the primary label fails>"],
   "org_unit_label": "<detected location or 'National'>",
   "periods": ["<DHIS2 period code>"],
   "disaggregations": ["<disaggregation token, e.g. ou_children>"],
@@ -224,18 +225,27 @@ Return JSON with these exact keys:
   "clarification_question": "<question or null>"
 }}
 
+CRITICAL RULES FOR METRIC LABELS:
+- The "label" should be the closest DHIS2 indicator name you can guess. DHIS2 indicators are named like: "Malaria confirmed cases", "ANC 1st visit", "OPV3 doses given", "BCG doses given", "HIV tests performed", "Maternal mortality cases".
+- The "search_terms" array MUST contain 2-5 alternative phrasings or related DHIS2 indicator names. Think about how the same concept appears in health information systems:
+  * For "shots": ["immunization", "vaccination", "doses given", "OPV", "Penta"]
+  * For "malaria deaths": ["malaria mortality", "malaria death", "malaria case fatality"]
+  * For "pregnant women visits": ["ANC", "antenatal", "ANC 1st visit"]
+- "metric_search_terms" is a global fallback list of 3-5 broad search terms if the primary labels fail.
+
 requires_data: set to true when the query needs DHIS2 data retrieval (e.g. health statistics, trends, comparisons, reports, exports). Set to false for casual chitchat, greetings, thank-yous, general knowledge questions, or meta-questions about the system that do NOT need health data from DHIS2.
 disaggregations: If the user explicitly asks to break down data spatially (e.g., "across all districts", "by region"), include "ou_children". If they ask for demographic/category breakdowns (e.g. "by age", "by gender", "by facility type"), include those layperson terms as strings (e.g. ["age", "gender"]). Otherwise leave it empty []. For time trends, use relative period codes (e.g. MONTHS_THIS_YEAR) instead of disaggregations.
 data_retrieval_strategy: Use "tracker_api" ONLY if the user explicitly asks for line lists, individual patient records, specific patient events, or un-aggregated dates (e.g., "date of previous malaria episode"). Use "data_value_sets" ONLY if the user explicitly asks for raw data validation, missing reports, or data entry errors before aggregation. Otherwise, always use "analytics_api" for aggregated totals, summaries, and percentages.
-clarification_needed: Set to true ONLY IF the query is completely nonsensical or utterly lacks a health subject. NEVER ask for clarification about DHIS2 specifics, metadata, exact indicator names, or periods. Always make your best guess and map the user's natural language to the closest logical structure.
+clarification_needed: Set to true ONLY IF the query is completely nonsensical or utterly lacks a health subject AND doesn't reference prior conversation. NEVER ask for clarification about DHIS2 specifics, metadata, exact indicator names, or periods. Always make your best guess.
 
 Few-Shot Examples:
 1. User: "How many kids got their shots in Bo last year?"
 {{
-  "query_expansion": "User asks for 'shots' in 'Bo' for 'last year'. Shots implies immunizations or vaccinations like Penta or OPV.",
+  "query_expansion": "'shots' = immunizations/vaccinations (Penta, OPV, BCG). 'kids' = children. 'Bo' = Bo district. 'last year' = LAST_YEAR.",
   "output_mode": "conversational",
   "requires_data": true,
-  "metrics": [{{"label": "Immunization coverage", "uid": null, "object_type": "indicator"}}],
+  "metrics": [{{"label": "Immunization doses given", "uid": null, "object_type": "dataElement", "search_terms": ["immunization", "vaccination", "OPV", "Penta", "doses given"]}}],
+  "metric_search_terms": ["immunization", "vaccination coverage", "OPV3 doses given", "BCG doses given", "Penta3 doses given"],
   "org_unit_label": "Bo",
   "periods": ["LAST_YEAR"],
   "disaggregations": [],
@@ -248,13 +258,68 @@ Few-Shot Examples:
 
 2. User: "Give me a dashboard of malaria deaths across all districts for the last 4 quarters."
 {{
-  "query_expansion": "User asks for 'malaria deaths' 'across all districts' for 'last 4 quarters'. Needs dashboard mode and spatial disaggregation.",
+  "query_expansion": "'malaria deaths' = malaria mortality/case fatality. 'across all districts' = ou_children spatial disaggregation. 'last 4 quarters' = LAST_4_QUARTERS.",
   "output_mode": "dashboard",
   "requires_data": true,
-  "metrics": [{{"label": "Malaria mortality rate", "uid": null, "object_type": "indicator"}}],
+  "metrics": [{{"label": "Malaria deaths", "uid": null, "object_type": "indicator", "search_terms": ["malaria mortality", "malaria death", "malaria case fatality"]}}],
+  "metric_search_terms": ["malaria deaths", "malaria mortality", "malaria confirmed"],
   "org_unit_label": "National",
   "periods": ["LAST_4_QUARTERS"],
   "disaggregations": ["ou_children"],
+  "data_retrieval_strategy": "analytics_api",
+  "needs_web_enrichment": false,
+  "web_search_queries": [],
+  "clarification_needed": false,
+  "clarification_question": null
+}}
+
+3. User: "Show me the trend of Malaria confirmed cases in Bo for the last 6 months."
+{{
+  "query_expansion": "Direct health indicator request. 'Malaria confirmed cases' is likely an exact DHIS2 indicator name.",
+  "output_mode": "dashboard",
+  "requires_data": true,
+  "metrics": [{{"label": "Malaria confirmed cases", "uid": null, "object_type": "indicator", "search_terms": ["malaria confirmed", "malaria cases", "confirmed malaria"]}}],
+  "metric_search_terms": ["malaria confirmed", "malaria cases"],
+  "org_unit_label": "Bo",
+  "periods": ["LAST_6_MONTHS"],
+  "disaggregations": [],
+  "data_retrieval_strategy": "analytics_api",
+  "needs_web_enrichment": false,
+  "web_search_queries": [],
+  "clarification_needed": false,
+  "clarification_question": null
+}}
+
+4. User: "Compare ANC 1st visit and ANC 4th or more visits in Kenema for this year."
+{{
+  "query_expansion": "Two specific DHIS2 indicators: ANC 1st visit and ANC 4th or more visits. Multi-metric comparison.",
+  "output_mode": "dashboard",
+  "requires_data": true,
+  "metrics": [
+    {{"label": "ANC 1st visit", "uid": null, "object_type": "indicator", "search_terms": ["ANC 1", "antenatal 1st", "ANC first visit"]}},
+    {{"label": "ANC 4th or more visits", "uid": null, "object_type": "indicator", "search_terms": ["ANC 4", "antenatal 4th", "ANC fourth"]}}
+  ],
+  "metric_search_terms": ["ANC", "antenatal"],
+  "org_unit_label": "Kenema",
+  "periods": ["THIS_YEAR"],
+  "disaggregations": [],
+  "data_retrieval_strategy": "analytics_api",
+  "needs_web_enrichment": false,
+  "web_search_queries": [],
+  "clarification_needed": false,
+  "clarification_question": null
+}}
+
+5. User: "Hello! Who are you?"
+{{
+  "query_expansion": "Casual greeting, no health data needed.",
+  "output_mode": "conversational",
+  "requires_data": false,
+  "metrics": [],
+  "metric_search_terms": [],
+  "org_unit_label": "National",
+  "periods": ["THIS_YEAR"],
+  "disaggregations": [],
   "data_retrieval_strategy": "analytics_api",
   "needs_web_enrichment": false,
   "web_search_queries": [],
@@ -359,15 +424,38 @@ def _extract_metric_labels(text: str) -> list[dict[str, Any]]:
 
     No hardcoded UIDs — returns UNRESOLVED markers for the metadata resolver
     to look up from whichever DHIS2 instance is connected.
+
+    Unlike the old version which stripped noise words and returned mangled
+    fragments, this extracts the health-topic noun phrase more carefully.
     """
-    # Strip temporal/location noise to isolate the health topic. Word-boundary
-    # matching only — a plain str.replace would gut real words (e.g. "state"
-    # inside "prostate", "this" inside "arthritis").
+    # Try to extract the health topic as the noun phrase between
+    # temporal/location markers. E.g. from "show me Malaria confirmed cases
+    # in Bo for last 6 months" → "Malaria confirmed cases"
+    topic_match = re.search(
+        r'(?:show me|give me|what (?:is|are|were)|how many|trend of|compare|breakdown of|data for)?\s*'
+        r'(?:the\s+)?'
+        r'([A-Z][\w\s\-/]+?)'
+        r'(?:\s+(?:in|for|at|from|across|by|over|during|last|this|between|since)\b|$)',
+        text,
+        re.IGNORECASE,
+    )
+    if topic_match:
+        label = topic_match.group(1).strip()
+        # Remove trailing prepositions/articles captured by the greedy match
+        label = re.sub(r'\s+(?:in|for|at|from|the|a|an|and|or)\s*$', '', label, flags=re.IGNORECASE).strip()
+        if len(label) >= 3:
+            return [{
+                "label": label,
+                "uid": "UNRESOLVED",
+                "uid_confidence": 0.40,
+                "object_type": "indicator",
+            }]
+
+    # Fallback: strip only the most obvious noise and keep the rest
     cleaned = _METRIC_NOISE_RE.sub(" ", text)
     cleaned = re.sub(r"\s+", " ", cleaned).strip()
-
-    if not cleaned:
-        cleaned = text  # fall back to full message
+    if not cleaned or len(cleaned) < 3:
+        cleaned = text.strip()
 
     return [{
         "label": cleaned,
@@ -605,11 +693,18 @@ def _merge_llm_intent(
     if strategy not in {"analytics_api", "tracker_api", "data_value_sets", "direct_sql", "both"}:
         strategy = "analytics_api"
 
+    # Collect global metric search terms (fallback search queries from the LLM)
+    raw_search_terms = parsed.get("metric_search_terms")
+    if not isinstance(raw_search_terms, list):
+        raw_search_terms = []
+    metric_search_terms = [str(t).strip() for t in raw_search_terms if t and str(t).strip()]
+
     return {
         "query_expansion": parsed.get("query_expansion", ""),
         "output_mode": output_mode,
         "requires_data": bool(parsed.get("requires_data", True)),
         "metrics": metrics,
+        "metric_search_terms": metric_search_terms,
         "org_unit": {
             "label": org_label,
             "uid": "UNRESOLVED",
@@ -617,8 +712,6 @@ def _merge_llm_intent(
         },
         "periods": valid_periods,
         "disaggregations": disaggregations,
-        # Honour the user's requested chart type on the primary path too,
-        # instead of hardcoding bar+line (kept the fallback contract in sync).
         "viz_types": _detect_viz_types(message.lower(), output_mode),
         "needs_web_enrichment": bool(parsed.get("needs_web_enrichment")),
         "web_search_queries": [str(q) for q in web_queries if q],
@@ -635,6 +728,9 @@ def _normalise_llm_metrics(raw: Any) -> list[dict[str, Any]]:
     hallucinated UIDs. LLM-supplied UIDs are never trusted on syntax alone —
     they are marked low-confidence so the metadata resolver verifies them
     against the synced index.
+
+    Now also preserves per-metric ``search_terms`` from the LLM for use by
+    the metadata resolver's multi-strategy search cascade.
     """
     if isinstance(raw, dict):
         raw = [raw]
@@ -650,17 +746,27 @@ def _normalise_llm_metrics(raw: Any) -> list[dict[str, Any]]:
         label = m.get("label")
         if not isinstance(label, str) or not label.strip():
             continue
-        metric = {
+        # Preserve per-metric search_terms from the LLM
+        search_terms = m.get("search_terms")
+        if not isinstance(search_terms, list):
+            search_terms = []
+        search_terms = [str(t).strip() for t in search_terms if t and str(t).strip()]
+
+        metric: dict[str, Any] = {
             "label": label.strip(),
             "uid": "UNRESOLVED",
             "uid_confidence": 0.40,
             "object_type": m.get("object_type") if isinstance(m.get("object_type"), str) else "indicator",
         }
+        if search_terms:
+            metric["search_terms"] = search_terms
         metrics.append(metric)
 
+    # Never return an empty metrics list — use the raw message as label
+    # instead of a generic placeholder that can't possibly match anything.
     if not metrics:
         metrics = [{
-            "label": "Health Service Coverage Rate",
+            "label": "Health indicator",
             "uid": "UNRESOLVED",
             "uid_confidence": 0.40,
             "object_type": "indicator",
