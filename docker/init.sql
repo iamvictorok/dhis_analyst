@@ -10,14 +10,13 @@ CREATE TABLE IF NOT EXISTS metadata_index (
     short_name TEXT,
     description TEXT,
     dataset_names TEXT,
-    embedding vector(1536),
+    embedding vector(3072),
     raw_metadata JSONB,
     last_synced_at TIMESTAMPTZ
 );
 
-CREATE INDEX IF NOT EXISTS metadata_index_embedding_idx
-ON metadata_index USING ivfflat (embedding vector_cosine_ops)
-WITH (lists = 100);
+-- Note: ivfflat/hnsw indices in pgvector support a maximum of 2000 dimensions.
+-- Since we support 3072 dimensions (e.g. Gemini), we rely on exact search without an index.
 
 CREATE INDEX IF NOT EXISTS metadata_index_name_idx
 ON metadata_index USING gin (to_tsvector('english', name || ' ' || COALESCE(short_name, '') || ' ' || COALESCE(description, '')));

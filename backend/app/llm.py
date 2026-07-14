@@ -180,7 +180,7 @@ def _resolve_model(settings: Settings) -> str:
 
     if provider == "ollama":
         return f"ollama/{model}"
-    if provider in {"openai", "azure", "anthropic", "cohere"} and "/" not in model:
+    if provider in {"openai", "azure", "anthropic", "cohere", "gemini"} and "/" not in model:
         return f"{provider}/{model}"
     return model
 

@@ -113,16 +113,13 @@ async def init_db() -> None:
                     short_name TEXT,
                     description TEXT,
                     dataset_names TEXT,
-                    embedding vector(1536),
+                    embedding vector(3072),
                     raw_metadata JSONB,
                     last_synced_at TIMESTAMPTZ
                 )
             """))
-            await conn.execute(text("""
-                CREATE INDEX IF NOT EXISTS metadata_index_embedding_idx
-                ON metadata_index USING ivfflat (embedding vector_cosine_ops)
-                WITH (lists = 100)
-            """))
+            # Note: ivfflat/hnsw indices in pgvector support a maximum of 2000 dimensions.
+            # Since we support 3072 dimensions (e.g. Gemini), we rely on exact search without an index.
             # Conversation history. Timestamps are stored as ISO-8601 TEXT to
             # match the values the persistence layer binds (asyncpg rejects a
             # Python str bound to a TIMESTAMPTZ column). ISO-8601 sorts

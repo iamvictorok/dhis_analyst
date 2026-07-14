@@ -77,8 +77,8 @@ async def sync_metadata(settings: Settings) -> dict[str, Any]:
                     totals["failed"] += 1
                     endpoint_failed += 1
                     logger.warning(
-                        "metadata_upsert_failed",
-                        extra={"uid": item.get("id"), "error": str(exc)},
+                        "metadata_upsert_failed uid=%s error=%s",
+                        item.get("id"), exc,
                     )
 
             endpoint_duration = time.time() - endpoint_start
@@ -146,9 +146,37 @@ async def _upsert_item(item: dict, object_type: str, settings: Settings) -> None
     # Build embedding text
     embed_text = f"{name} {short_name} {description} {dataset_names}".strip()
 
+    # Check if we need to re-embed
+    needs_embedding = True
+    
+    from backend.app.db.session import get_db_session
+    from sqlalchemy import text
+    
+    async with get_db_session() as session:
+        if settings.is_postgres:
+            res = await session.execute(text("SELECT name, short_name, description, dataset_names, embedding FROM metadata_index WHERE uid = :uid"), {"uid": uid})
+        else:
+            res = await session.execute(text("SELECT name, short_name, description, dataset_names FROM metadata_index_fts WHERE uid = :uid"), {"uid": uid})
+        existing = res.fetchone()
+        
+    if existing:
+        ex_name = existing[0] or ""
+        ex_short = existing[1] or ""
+        ex_desc = existing[2] or ""
+        ex_dsn = existing[3] or ""
+        existing_text = f"{ex_name} {ex_short} {ex_desc} {ex_dsn}".strip()
+        
+        if existing_text == embed_text:
+            if settings.is_postgres:
+                # Only skip if we actually have an embedding stored (existing[4] is not null)
+                if existing[4] is not None:
+                    needs_embedding = False
+            else:
+                needs_embedding = False
+
     # Generate embedding vector
-    embedding: list[float] = []
-    if settings.is_postgres and settings.embedding_provider != "mock":
+    embedding: list[float] | None = None
+    if needs_embedding and settings.is_postgres and settings.embedding_provider != "mock":
         try:
             from backend.app.llm import embed
             embedding = await embed(embed_text, settings)
@@ -188,7 +216,7 @@ async def _upsert_postgres(
                 short_name = EXCLUDED.short_name,
                 description = EXCLUDED.description,
                 dataset_names = EXCLUDED.dataset_names,
-                embedding = EXCLUDED.embedding,
+                embedding = COALESCE(EXCLUDED.embedding, metadata_index.embedding),
                 raw_metadata = EXCLUDED.raw_metadata,
                 last_synced_at = NOW()
             """),
