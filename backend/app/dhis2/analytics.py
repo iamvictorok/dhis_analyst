@@ -27,10 +27,21 @@ def build_analytics_params(state: AgentState) -> dict[str, Any]:
     )
     # Filter out UNRESOLVED and empty UIDs — sending them to DHIS2 causes
     # cryptic 409 errors ("dimension is present without valid options").
-    dx_items = [
-        m["uid"] for m in state["metrics"]
-        if m.get("uid") and m["uid"] != "UNRESOLVED" and DHIS2_UID_RE.match(m["uid"])
-    ]
+    # Also validate object_type: only indicator-compatible types belong in dx.
+    _DX_VALID_TYPES = {"indicator", "dataElement", "programIndicator"}
+    dx_items = []
+    for m in state["metrics"]:
+        uid = m.get("uid", "")
+        if not uid or uid == "UNRESOLVED" or not DHIS2_UID_RE.match(uid):
+            continue
+        obj_type = m.get("object_type", "indicator")
+        if obj_type not in _DX_VALID_TYPES:
+            logger.warning(
+                "analytics_dx_type_mismatch",
+                extra={"uid": uid, "label": m.get("label"), "object_type": obj_type},
+            )
+            continue
+        dx_items.append(uid)
     if not dx_items:
         resolved_labels = [m.get("label", "?") for m in state["metrics"]]
         raise ValueError(

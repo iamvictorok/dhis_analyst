@@ -122,17 +122,42 @@ def _expand_with_synonyms(tokens: list[str]) -> list[list[str]]:
 def _build_indicator_results(
     rows, original_query: str, base_confidence: float,
 ) -> list[dict[str, Any]]:
-    """Score and format indicator search results with quality-graded confidence."""
+    """Score and format indicator search results with quality-graded confidence.
+
+    Uses token-coverage ratio: 'Malaria confirmed cases' matching an indicator
+    named 'Malaria confirmed cases reported at facilities' scores 3/3 query
+    tokens = 0.92, while matching 'Malaria testing rate' scores 1/3 = lower.
+    """
     results = []
     query_lower = original_query.lower()
+    query_tokens = [t for t in query_lower.split() if len(t) >= 2]
+    n_query_tokens = max(len(query_tokens), 1)
+
     for row in rows:
         name_lower = row[1].lower()
         if name_lower == query_lower:
             confidence = 0.95
-        elif query_lower in name_lower or name_lower in query_lower:
+        elif (query_lower in name_lower or name_lower in query_lower) and (
+            len(query_lower) / max(len(name_lower), 1) >= 0.6
+            or len(name_lower) / max(len(query_lower), 1) >= 0.6
+        ):
+            # Substring containment with significant overlap — near-exact
             confidence = max(base_confidence, 0.88)
         else:
-            confidence = base_confidence
+            # Bidirectional token coverage: use the LOWER of query-side and
+            # name-side ratios so a single vague term ("malaria") matching a
+            # multi-word name ("Malaria deaths") stays low, while a specific
+            # multi-word query matching well scores high.
+            matched = sum(1 for t in query_tokens if t in name_lower)
+            name_tokens = [t for t in name_lower.split() if len(t) >= 2]
+            n_name_tokens = max(len(name_tokens), 1)
+            name_matched = sum(1 for t in name_tokens if t in query_lower)
+            query_coverage = matched / n_query_tokens
+            name_coverage = name_matched / n_name_tokens
+            coverage = min(query_coverage, name_coverage)
+            # Scale between base_confidence and 0.92 based on coverage
+            confidence = base_confidence + coverage * (0.92 - base_confidence)
+            confidence = round(min(confidence, 0.92), 4)
         results.append({
             "uid": row[0],
             "label": row[1],
@@ -142,6 +167,64 @@ def _build_indicator_results(
             "uid_confidence": confidence,
         })
     return results
+
+
+# ---------------------------------------------------------------------------
+# Indicator name catalogue — for LLM prompt injection
+# ---------------------------------------------------------------------------
+
+# In-memory TTL cache: avoids a DB round-trip on every intent classification
+# call.  Invalidated automatically after _CATALOGUE_TTL_SECONDS or when the
+# metadata sync upserts new rows (call invalidate_indicator_catalogue_cache).
+_catalogue_cache: dict[str, tuple[float, str]] = {}  # key → (expires_at, value)
+_CATALOGUE_TTL_SECONDS = 600  # 10 minutes
+
+
+def invalidate_indicator_catalogue_cache() -> None:
+    """Clear the cached catalogue — call after metadata sync completes."""
+    _catalogue_cache.clear()
+
+
+async def get_indicator_names_for_prompt(
+    session,
+    *,
+    is_postgres: bool = False,
+    limit: int = 500,
+) -> str:
+    """Return a compact newline-delimited list of indicator/dataElement names.
+
+    Designed for injection into the intent classifier system prompt so the LLM
+    can emit exact DHIS2 indicator names instead of guessing.  Sorted by name
+    length (shortest first) to front-load the most specific, unambiguous names.
+
+    Results are cached in memory for 10 minutes to avoid a DB query on every
+    intent classification call.  The catalogue only changes on metadata sync.
+    """
+    import time
+    from sqlalchemy import text
+
+    cache_key = f"{is_postgres}:{limit}"
+    now = time.monotonic()
+    cached = _catalogue_cache.get(cache_key)
+    if cached and cached[0] > now:
+        return cached[1]
+
+    table = "metadata_index" if is_postgres else "metadata_index_fts"
+    result = await session.execute(
+        text(f"""
+            SELECT DISTINCT name
+            FROM {table}
+            WHERE object_type IN ('indicator', 'dataElement', 'programIndicator')
+              AND name IS NOT NULL AND name != ''
+            ORDER BY LENGTH(name), name
+            LIMIT :lim
+        """),
+        {"lim": limit},
+    )
+    names = [row[0] for row in result.fetchall()]
+    value = "\n".join(names)
+    _catalogue_cache[cache_key] = (now + _CATALOGUE_TTL_SECONDS, value)
+    return value
 
 
 # ---------------------------------------------------------------------------

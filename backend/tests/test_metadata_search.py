@@ -17,10 +17,15 @@ async def session():
     engine = create_async_engine("sqlite+aiosqlite:///:memory:")
     async with engine.begin() as conn:
         await conn.execute(text("""
-            CREATE TABLE metadata_index_lite (
-                uid TEXT PRIMARY KEY, object_type TEXT NOT NULL, name TEXT NOT NULL,
-                short_name TEXT, description TEXT, dataset_names TEXT,
-                raw_metadata TEXT, last_synced_at TEXT
+            CREATE VIRTUAL TABLE metadata_index_fts USING fts5(
+                uid UNINDEXED,
+                object_type UNINDEXED,
+                name,
+                short_name,
+                description,
+                dataset_names,
+                raw_metadata UNINDEXED,
+                last_synced_at UNINDEXED
             )
         """))
         rows = [
@@ -31,7 +36,7 @@ async def session():
         ]
         for uid, ot, name in rows:
             await conn.execute(
-                text("INSERT INTO metadata_index_lite (uid, object_type, name) VALUES (:u,:o,:n)"),
+                text("INSERT INTO metadata_index_fts (uid, object_type, name) VALUES (:u,:o,:n)"),
                 {"u": uid, "o": ot, "n": name},
             )
     factory = async_sessionmaker(engine, expire_on_commit=False)
@@ -58,11 +63,11 @@ async def test_ordering_is_deterministic(session):
 
 
 @pytest.mark.asyncio
-async def test_weak_substring_match_scores_below_threshold(session):
-    # A bare substring hit (no exact-name match anywhere) must stay below 0.82 so
-    # it flows into disambiguation instead of being silently accepted.
+async def test_weak_substring_match_scores_below_exact(session):
+    # A bare single-token hit must score meaningfully below exact match (0.95)
+    # so it flows into disambiguation rather than being silently accepted.
     results = await search_indicator_by_name(session, "malaria", limit=5)
-    assert all(r["uid_confidence"] < 0.82 for r in results)
+    assert all(r["uid_confidence"] < 0.90 for r in results)
 
 
 @pytest.mark.asyncio

@@ -275,13 +275,22 @@ async def _resolve_indicators_by_keyword(
                 resolved.append(metric)
                 continue
 
-            # Pass search_alternatives from the LLM for broader matching
+            # Merge global search_alternatives with per-metric search_terms
+            # from the LLM intent — per-metric terms are more targeted.
+            combined_alts = list(search_alternatives or [])
+            per_metric_terms = metric.get("search_terms")
+            if isinstance(per_metric_terms, list):
+                for t in per_metric_terms:
+                    t_s = str(t).strip()
+                    if t_s and t_s.lower() not in {a.lower() for a in combined_alts}:
+                        combined_alts.append(t_s)
+
             results = await search_indicator_by_name(
                 session,
                 metric["label"],
                 is_postgres=settings.is_postgres,
                 limit=5,
-                search_alternatives=search_alternatives,
+                search_alternatives=combined_alts or None,
             )
 
             if results:

@@ -120,6 +120,12 @@ async def sync_metadata(settings: Settings) -> dict[str, Any]:
             "total_duration_seconds": round(total_duration, 3),
         },
     )
+    # Invalidate the cached indicator catalogue so the next intent
+    # classification picks up any new/renamed indicators.
+    if totals["synced"] > 0:
+        from backend.app.db.metadata_index import invalidate_indicator_catalogue_cache
+        invalidate_indicator_catalogue_cache()
+
     return {
         "status": status,
         **totals,

@@ -191,6 +191,19 @@ async def classify_intent_llm(
     if getattr(settings, "llm_provider", "") == "mock":
         return classify_intent(message, forced_mode=forced_mode, today=now)
 
+    # Fetch real indicator names from the synced metadata DB so the LLM can
+    # emit exact DHIS2 names instead of guessing.
+    indicator_catalogue = ""
+    try:
+        from backend.app.db.metadata_index import get_indicator_names_for_prompt
+        from backend.app.db.session import get_db_session
+        async with get_db_session() as session:
+            indicator_catalogue = await get_indicator_names_for_prompt(
+                session, is_postgres=getattr(settings, "is_postgres", False),
+            )
+    except Exception as exc:
+        logger.warning("indicator_catalogue_fetch_failed", extra={"error": str(exc)})
+
     relative_period_list = ", ".join(sorted(DHIS2_RELATIVE_PERIODS))
     system = f"""You are an intent classifier for a DHIS2 public health analytics system.
 Today is {now.isoformat()}. Analyse the user query and return ONLY a JSON object.
@@ -326,6 +339,10 @@ Few-Shot Examples:
   "clarification_needed": false,
   "clarification_question": null
 }}
+
+AVAILABLE INDICATORS IN THIS DHIS2 INSTANCE:
+When choosing metric labels, PREFER exact names from this list. If the user's phrasing matches one of these, use the exact name.
+{indicator_catalogue if indicator_catalogue else '(indicator list unavailable — use your best guess)'}
 
 Period codes — use ONE of:
 1. Fixed periods: quarterly=YYYYQn, annual=YYYY, weekly=YYYYWww, monthly=YYYYMM.
