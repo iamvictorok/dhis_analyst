@@ -32,6 +32,33 @@ from backend.app.models import ChatRequest, Identity
 logger = logging.getLogger("dhis2_analyst.graph")
 
 
+class _NodeTimes:
+    """Context-local list of (node, seconds) for the current request."""
+    import contextvars as _cv
+    _var = _cv.ContextVar("node_times", default=None)
+
+    def begin(self) -> list:
+        lst: list = []
+        self._var.set(lst)
+        return lst
+
+    def append(self, item) -> None:
+        lst = self._var.get()
+        if lst is not None:
+            lst.append(item)
+
+
+_NODE_TIMES = _NodeTimes()
+
+
+def _timings_event(start: float, nodes: list, calls: list) -> str:
+    return sse("timings", {
+        "total_seconds": round(time.monotonic() - start, 2),
+        "nodes": [{"node": n, "seconds": t} for n, t in nodes],
+        "llm_calls": calls,
+    })
+
+
 def sse(event: str, payload: dict | list | str | None = None) -> str:
     body = json.dumps(_json_ready(payload if payload is not None else {}), ensure_ascii=False)
     return f"event: {event}\ndata: {body}\n\n"
@@ -57,6 +84,7 @@ async def _timed_node(
     try:
         return await fn(state, settings)
     finally:
+        _NODE_TIMES.append((name, round(time.monotonic() - start, 2)))
         logger.info(
             "agent_node_timing",
             extra={
@@ -140,11 +168,16 @@ async def run_agent_stream(
         },
     )
     pipeline_start = time.monotonic()
+    from backend.app.llm import begin_call_log
+    _llm_calls = begin_call_log()
+    _nodes = _NODE_TIMES.begin()
     from backend.app.dhis2 import failover
     source_tracker = failover.begin_request()
 
+    _t_intent = time.monotonic()
     try:
         state = await build_initial_state(request, settings, identity, history, dhis2_token)
+        _NODE_TIMES.append(("classify_intent", round(time.monotonic() - _t_intent, 2)))
     except Exception as exc:
         logger.error("intent_classification_failed", extra={"error": str(exc)}, exc_info=True)
         error_str = str(exc).lower()
@@ -156,6 +189,7 @@ async def run_agent_stream(
             msg = "Could not understand your request due to an AI parsing error. Please try rephrasing."
         
         yield sse("error", {"code": "INTENT_FAILED", "user_message": msg, "detail": str(exc)})
+        yield _timings_event(pipeline_start, _nodes, _llm_calls)
         yield sse("done")
         return
 
@@ -168,6 +202,7 @@ async def run_agent_stream(
     # --- Clarification gate ---
     if state["clarification_needed"]:
         yield sse("clarification", {"question": state["clarification_question"]})
+        yield _timings_event(pipeline_start, _nodes, _llm_calls)
         yield sse("done")
         return
 
@@ -179,11 +214,13 @@ async def run_agent_stream(
         except Exception as exc:
             logger.error("metadata_resolve_failed", extra={"error": str(exc)})
             yield sse("error", {"code": "METADATA_FAILED", "user_message": "Could not resolve indicator metadata.", "detail": str(exc)})
+            yield _timings_event(pipeline_start, _nodes, _llm_calls)
             yield sse("done")
             return
 
         if state["clarification_needed"]:
             yield sse("clarification", {"question": state["clarification_question"]})
+            yield _timings_event(pipeline_start, _nodes, _llm_calls)
             yield sse("done")
             return
 
@@ -192,6 +229,7 @@ async def run_agent_stream(
             logger.info("concept_not_available", extra={"session_id": state["session_id"]})
             for chunk in _chunk(state["not_available_message"], 64):
                 yield sse("token", {"text": chunk})
+            yield _timings_event(pipeline_start, _nodes, _llm_calls)
             yield sse("done")
             return
 
@@ -216,6 +254,7 @@ async def run_agent_stream(
                 "code": "INDICATORS_NOT_FOUND",
                 "user_message": friendly,
             })
+            yield _timings_event(pipeline_start, _nodes, _llm_calls)
             yield sse("done")
             return
 
@@ -345,6 +384,7 @@ async def run_agent_stream(
         
         if state.get("fetch_error"):
             logger.info("agent_done_fetch_error", extra={"session_id": state["session_id"], "mode": mode})
+            yield _timings_event(pipeline_start, _nodes, _llm_calls)
             yield sse("done")
             return
             
@@ -354,6 +394,7 @@ async def run_agent_stream(
                 yield sse("token", {"text": data_used + "\n\n"})
             yield sse("report_html", {"html": _no_data_html(state)})
             logger.info("agent_done_no_data", extra={"session_id": state["session_id"], "mode": mode})
+            yield _timings_event(pipeline_start, _nodes, _llm_calls)
             yield sse("done")
             return
 
@@ -363,6 +404,7 @@ async def run_agent_stream(
     except Exception as exc:
         logger.error("content_generation_failed", extra={"error": str(exc)})
         yield sse("error", {"code": "CONTENT_FAILED", "user_message": "Content generation failed.", "detail": str(exc)})
+        yield _timings_event(pipeline_start, _nodes, _llm_calls)
         yield sse("done")
         return
 
@@ -436,6 +478,7 @@ async def run_agent_stream(
             "duration_ms": int((time.monotonic() - pipeline_start) * 1000),
         },
     )
+    yield _timings_event(pipeline_start, _nodes, _llm_calls)
     yield sse("done")
 
 

@@ -1091,7 +1091,18 @@ async def _expert_resolve(state: AgentState, settings: Settings) -> dict:
             without = [c for c in pool if not c["has_data"]][: max(3, 12 - len(with_data))]
             shown = sorted(with_data + without, key=lambda c: -c["score"])[:12]
         verdict = None
+        if R.is_vague(q_user) and not context:
+            # "Show me coverage": nothing in the user's words picks a measure.
+            # Ask, whatever the parser guessed; options come from the user's words.
+            vague_pool = R.rank_candidates([(q_user, 1.0)], cat, limit=40) if q_user else []
+            for c in vague_pool:
+                c["has_data"] = None if (has is None or c["uid"] not in has) else (has[c["uid"]] is not None)
+            opts = R.diversify([c for c in vague_pool if c["has_data"] is not False] or vague_pool, 12, keep_top=1)
+            return {"decision": "ambiguous", "choice": 0, "alternatives": [], "options": [],
+                    "candidates": opts or shown, "label": label, "by": "vague",
+                    "requested_concept": " ".join(user_text.split()[:6]) if not q_user else " ".join(q_user)}
         if use_llm and shown:
+            await R.annotate_program_names(client, shown)
             verdict = await R.llm_judge(user_text, label, shown, _place_text(state), _period_text(state),
                                         context, settings)
         if verdict is None:
@@ -1099,6 +1110,8 @@ async def _expert_resolve(state: AgentState, settings: Settings) -> dict:
             verdict = R.deterministic_judge(q_user, rescored, unknown)
         verdict["candidates"] = shown
         verdict["label"] = label
+        if verdict["decision"] == "match":
+            _prefer_aggregate(verdict, user_text, q_user, cat, R)
         return verdict
 
     verdicts = await asyncio.gather(*(one(i) for i in todo))
@@ -1175,6 +1188,12 @@ def _ambiguous_question(v: dict) -> str:
     concept = v.get("requested_concept") or v.get("label") or "that"
     opts = _pick_options(v, 5)
     lines = "\n".join(f"{k}. {_option_line(c)}" for k, c in enumerate(opts, 1))
+    if v.get("source_conflict"):
+        return (
+            f"“{concept}” exists in this DHIS2 instance both as routine aggregate data and as tracker "
+            f"(individual-record) programme data, and they give different numbers. Which source do you want?\n\n"
+            f"{lines}\n\nReply with the name (or number), and I'll run it."
+        )
     return (
         f"“{concept}” could mean several different measures in this DHIS2 instance. Which one do you want?\n\n"
         f"{lines}\n\nReply with the name (or number), and I'll run it."
@@ -1271,3 +1290,25 @@ async def _fuzzy_org_unit(label: str, settings: Settings) -> dict | None:
         logger.info("org_unit_fuzzy_resolved", extra={"label": label, "resolved": best[1]["label"]})
         return best[1]
     return None
+
+
+def _prefer_aggregate(verdict: dict, user_text: str, q_user: list[str], cat: dict, R) -> None:
+    """Routine (aggregate) data is the default answer in DHIS2.
+
+    If a tracker program indicator was chosen although the user never mentioned
+    a programme/tracker/case-based source, and the judge itself listed an
+    aggregate data element/indicator with data as measuring the same concept,
+    use the aggregate one (the program indicator stays as an alternate).
+    """
+    cands = verdict["candidates"]
+    chosen = cands[verdict["choice"] - 1]
+    if chosen.get("object_type") != "programIndicator" or R.mentions_tracker(user_text):
+        return
+    for j in verdict.get("alternatives") or []:
+        c = cands[j - 1]
+        if c.get("object_type") in ("dataElement", "indicator") and c.get("has_data"):
+            old_choice = verdict["choice"]
+            verdict["choice"] = j
+            verdict["alternatives"] = [old_choice] + [k for k in verdict["alternatives"] if k not in (j, old_choice)]
+            verdict["by"] = f"{verdict.get('by')}+aggregate"
+            return

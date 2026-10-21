@@ -15,6 +15,25 @@ from backend.config import Settings
 
 logger = logging.getLogger("dhis2_analyst.llm")
 
+# Per-request LLM call log (purpose, model, seconds, transient errors), exposed
+# to the client in the final "timings" SSE event so latency can be diagnosed
+# without server log access. No prompts, keys or content are recorded.
+import contextvars
+
+_CALL_LOG: contextvars.ContextVar[list | None] = contextvars.ContextVar("llm_call_log", default=None)
+
+
+def begin_call_log() -> list:
+    log: list = []
+    _CALL_LOG.set(log)
+    return log
+
+
+def _record_call(entry: dict) -> None:
+    log = _CALL_LOG.get()
+    if log is not None:
+        log.append(entry)
+
 _TRANSIENT_MARKERS = (
     "503", "unavailable", "high demand", "overloaded", "429", "resource_exhausted",
     "rate limit", "ratelimit", "timeout", "timed out", "500", "internal error",
@@ -124,6 +143,8 @@ async def complete(
                         await asyncio.sleep(settings.llm_retry_backoff_seconds * (2 ** attempt))
                     continue
                 content = response.choices[0].message.content or ""
+                _record_call({"model": candidate, "fallback": idx > 0, "attempt": attempt + 1,
+                              "seconds": round(time.monotonic() - start, 2), "json": json_mode})
                 logger.info(
                     "llm_call_ok",
                     extra={
@@ -136,6 +157,8 @@ async def complete(
                 )
                 return content
         assert last_exc is not None
+        _record_call({"model": model, "failed": True, "seconds": round(time.monotonic() - start, 2),
+                      "error": type(last_exc).__name__})
         raise last_exc
 
     except Exception as exc:

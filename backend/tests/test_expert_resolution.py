@@ -220,3 +220,31 @@ def test_not_available_message_streams_without_data(monkeypatch, tmp_path):
 
     body = "".join(asyncio.run(collect()))
     assert "isn't available" in body and "chart_config" not in body
+
+
+def test_vague_detection():
+    assert R.is_vague(R.content_tokens("Show me coverage"))
+    assert R.is_vague(R.content_tokens("How many cases this year?"))
+    assert not R.is_vague(R.content_tokens("Penta3 coverage in Kenema"))
+
+
+def test_tracker_words():
+    assert R.mentions_tracker("From the Child Programme tracker, how many BCG doses")
+    assert not R.mentions_tracker("Malaria confirmed cases by district")
+
+
+def test_prefer_aggregate_uses_judges_aggregate_alternative():
+    from backend.app.agent.nodes.metadata_resolve import _prefer_aggregate
+    cands = [
+        {"uid": "pi", "label": "Malaria case count", "object_type": "programIndicator", "has_data": True, "score": 0.7},
+        {"uid": "de", "label": "IDSR Malaria", "object_type": "dataElement", "has_data": True, "score": 0.33},
+    ]
+    v = {"decision": "match", "choice": 1, "alternatives": [2], "candidates": cands, "by": "llm"}
+    _prefer_aggregate(v, "Malaria confirmed cases by district", [], CAT, R)
+    assert cands[v["choice"] - 1]["uid"] == "de" and v["alternatives"] == [1]
+    v2 = {"decision": "match", "choice": 1, "alternatives": [2], "candidates": cands, "by": "llm"}
+    _prefer_aggregate(v2, "Malaria case count from the tracker programme", [], CAT, R)
+    assert v2["choice"] == 1
+    v3 = {"decision": "match", "choice": 1, "alternatives": [], "candidates": cands, "by": "llm"}
+    _prefer_aggregate(v3, "Malaria confirmed cases", [], CAT, R)
+    assert v3["choice"] == 1

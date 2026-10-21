@@ -145,11 +145,11 @@ async def load_catalogue(settings: Settings) -> dict[str, Any]:
     table = "metadata_index" if settings.is_postgres else "metadata_index_fts"
     async with get_db_session() as session:
         rows = (await session.execute(text(
-            f"SELECT uid, name, short_name, object_type, description FROM {table} "
+            f"SELECT uid, name, short_name, object_type, description, dataset_names FROM {table} "
             "WHERE object_type IN ('indicator','dataElement','programIndicator','orgUnit')"
         ))).fetchall()
     items, df, ou_tokens = [], {}, set()
-    for uid, name, short, otype, desc in rows:
+    for uid, name, short, otype, desc, dsn in rows:
         name = " ".join(str(name or "").split())
         if otype == "orgUnit":
             ou_tokens.update(tokens(name))
@@ -159,6 +159,7 @@ async def load_catalogue(settings: Settings) -> dict[str, Any]:
             continue
         items.append({"uid": uid, "label": name, "object_type": otype,
                       "description": (desc or "")[:200], "tokens": toks,
+                      "source": " ".join(str(dsn or "").split())[:80],
                       "name_tokens": tokens(name)})
         for w in toks:
             df[w] = df.get(w, 0) + 1
@@ -240,6 +241,7 @@ def rank_candidates(queries: list[tuple[list[str], float]], cat: dict, limit: in
                 best[it["uid"]] = {"uid": it["uid"], "label": it["label"],
                                    "object_type": it["object_type"],
                                    "description": it["description"], "score": round(s, 4),
+                                   "source": it.get("source", ""),
                                    "_family": (sig, it["object_type"])}
     ranked = sorted(best.values(), key=lambda c: (-c["score"], len(c["label"]), c["uid"]))
     out, fam_count = [], {}
@@ -318,7 +320,7 @@ JUDGE_PROMPT = """You are a DHIS2 implementer choosing which data item answers a
 Only the candidates below exist in this DHIS2 instance; nothing else does.
 
 {context}User question: "{question}"
-Concept the parser extracted: "{label}"
+The parser's guess (may be wrong; judge the USER's words, not this guess): "{label}"
 Place: {place}. Period: {period}.
 
 Candidates (name [type] - data for this place/period):
@@ -330,9 +332,12 @@ Decide:
   If the user asks for coverage, a rate, a percentage or a dropout, prefer an indicator; for counts,
   doses, cases or visits prefer a data element. Prefer candidates that have data. Prefer routine
   aggregate data elements/indicators over tracker program indicators unless the user mentions a
-  programme, tracker, case-based or individual-level data. Pick the overall total rather than a
+  programme, tracker, case-based or individual-level data: when both a routine aggregate item and a
+  tracker program indicator measure the concept, choose the aggregate one and list the program
+  indicator in "alternatives". Data set / programme names are strong clues (e.g. a weekly
+  surveillance data set holds confirmed case counts). Pick the overall total rather than a
   sex/age-specific variant unless the user asked for that variant.
-- "ambiguous": the question names only a broad area (for example just "coverage", "immunisation",
+- "ambiguous": the user's own words name only a broad area (for example just "coverage", "immunisation",
   "maternal health", "malaria data") without saying which measure, and several different candidates
   fit about equally. Variants of one measure are not ambiguity.
 - "not_available": the specific disease, vaccine, service, programme or measure the user names is not
@@ -375,7 +380,12 @@ def _fmt_candidates(cands: list[dict]) -> str:
         else:
             avail = "NO data"
         desc = f" ({c['description'][:90]})" if c.get("description") else ""
-        lines.append(f"{i}. \"{c['label']}\" [{TYPE_LABEL.get(c['object_type'], c['object_type'])}] - {avail}{desc}")
+        src = ""
+        if c.get("source"):
+            src = (f"; programme: {c['source']}" if c["object_type"] == "programIndicator"
+                   else f"; data set: {c['source']}")
+        kind = "routine aggregate" if c["object_type"] != "programIndicator" else "tracker/event"
+        lines.append(f"{i}. \"{c['label']}\" [{TYPE_LABEL.get(c['object_type'], c['object_type'])}, {kind}{src}] - {avail}{desc}")
     return "\n".join(lines)
 
 
@@ -425,6 +435,21 @@ async def llm_judge(question: str, label: str, cands: list[dict], place: str, pe
         "reason": str(parsed.get("reason") or "")[:200],
         "by": "llm",
     }
+
+
+def is_vague(q_user: list[str]) -> bool:
+    """No word in the question identifies a measure (only "coverage", "cases", ...)."""
+    return not [w for w in q_user if w not in _GENERIC and not w.isdigit()]
+
+
+_TRACKER_WORDS = re.compile(
+    r"\b(program(?:me)?s?|tracker|case[- ]based|event(?:s)?|individual|line[- ]?list|register(?:ed)?|enrol(?:l)?ments?|registry)\b",
+    re.I,
+)
+
+
+def mentions_tracker(text: str) -> bool:
+    return bool(_TRACKER_WORDS.search(text or ""))
 
 
 def deterministic_judge(q_user: list[str], cands: list[dict], unknown: list[str]) -> dict:
@@ -530,3 +555,23 @@ def level_name(level: int | None, levels: list[dict] | None) -> str:
         if lv["level"] == level:
             return lv["name"]
     return f"level {level}"
+
+
+_PI_PROGRAM_CACHE: dict[str, str] = {}
+
+
+async def annotate_program_names(client, cands: list[dict]) -> None:
+    """Fill ``source`` with the programme name for program indicators (one call, cached)."""
+    need = [c["uid"] for c in cands if c["object_type"] == "programIndicator"
+            and not c.get("source") and c["uid"] not in _PI_PROGRAM_CACHE]
+    if need and client is not None:
+        try:
+            raw = await client.get("/api/programIndicators.json", params={
+                "filter": f"id:in:[{','.join(need)}]", "fields": "id,program[name]", "paging": "false"})
+            for pi in raw.get("programIndicators") or []:
+                _PI_PROGRAM_CACHE[pi["id"]] = ((pi.get("program") or {}).get("name") or "")[:80]
+        except Exception as exc:
+            logger.info("pi_program_lookup_failed", extra={"error": str(exc)[:200]})
+    for c in cands:
+        if c["object_type"] == "programIndicator" and not c.get("source"):
+            c["source"] = _PI_PROGRAM_CACHE.get(c["uid"], "")
