@@ -54,3 +54,8 @@ class AgentState(TypedDict):
     # Raw DHIS2 personal access token for the current user, when authenticated
     # in dhis2/combined mode; enables per-user DHIS2 API calls instead of mock.
     _dhis2_token: Optional[str]
+    # Set by the expert resolver: plain message when the requested concept is
+    # not in this instance, notes shown under "Data used", category names.
+    not_available_message: Optional[str]
+    resolution_notes: list[str]
+    category_labels: dict[str, str]

@@ -14,6 +14,7 @@ are distinguished from genuine misses so the user is never told a valid indicato
 """
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import re
@@ -71,6 +72,53 @@ async def resolve_metadata(state: AgentState, settings: Settings) -> AgentState:
     except Exception as exc:
         logger.warning("reporting_rate_scan_failed", extra={"error": str(exc)})
 
+    # --- Org unit resolution ---
+    org_unit = state.get("org_unit", {})
+    org_label = org_unit.get("label", "National")
+    org_uid = org_unit.get("uid", "")
+
+    # Check if the UID looks like a placeholder (fabricated from the label)
+    needs_resolution = (
+        not org_uid
+        or org_uid == org_label.upper().replace(" ", "_")
+        or not _looks_like_dhis2_uid(org_uid)
+    )
+
+    if needs_resolution and org_label.lower() not in {"national", "federal"}:
+        try:
+            resolved = await _resolve_org_unit_from_db_or_live_api(
+                org_label, settings, token=state.get("_dhis2_token")
+            )
+            if resolved:
+                resolved = {**resolved, "original_label": org_label}
+                state["org_unit"] = resolved
+                logger.info(
+                    "org_unit_resolved",
+                    extra={
+                        "original_label": org_label,
+                        "resolved_uid": resolved["uid"],
+                        "resolved_label": resolved["label"],
+                        "resolved_level": resolved["level"],
+                    },
+                )
+            else:
+                # Index reachable but no match for an explicitly named location.
+                # Do not block with a clarification. Let the analytics builder fall back to USER_ORGUNIT.
+                logger.warning(
+                    "org_unit_not_found_proceeding",
+                    extra={"label": org_label, "using_placeholder": org_uid},
+                )
+        except Exception as exc:
+            # Infra failure — leave the org unit as-is and let the analytics
+            # builder fall back to USER_ORGUNIT; do not block with a clarification.
+            logger.warning("org_unit_resolve_failed", extra={"label": org_label, "error": str(exc)})
+
+    # --- Breakdown level ("by district", "each chiefdom", "facilities in Bo") ---
+    try:
+        await _apply_breakdown_level(state, settings)
+    except Exception as exc:
+        logger.warning("breakdown_level_failed", extra={"error": str(exc)})
+
     # 0. The user typed exact DHIS2 names (e.g. "IDSR Malaria"): trust them over
     #    whatever label the LLM paraphrased them into ("Malaria case").
     try:
@@ -103,6 +151,22 @@ async def resolve_metadata(state: AgentState, settings: Settings) -> AgentState:
             state["metrics"] = metrics
     except Exception as exc:  # never block the pipeline on this shortcut
         logger.warning("exact_name_scan_failed", extra={"error": str(exc)})
+    # --- Expert resolution: rank, probe for data, judge (match / ambiguous / not available) ---
+    if not reporting_rate_resolved:
+        try:
+            outcome = await _expert_resolve(state, settings)
+        except Exception as exc:
+            logger.warning("expert_resolve_failed", extra={"error": str(exc)}, exc_info=True)
+            outcome = {"status": "skip"}
+        if outcome["status"] == "clarify":
+            state["clarification_needed"] = True
+            state["clarification_question"] = outcome["question"]
+            return state
+        if outcome["status"] == "not_available":
+            state["not_available_message"] = outcome["message"]
+            return state
+        metrics = state["metrics"]
+
     low_confidence = [m for m in metrics if m["uid_confidence"] < threshold]
     if reporting_rate_resolved:
         low_confidence = []
@@ -203,52 +267,38 @@ async def resolve_metadata(state: AgentState, settings: Settings) -> AgentState:
                     m["uid_confidence"] = threshold  # promote to pass the gate
             state["metrics"] = metrics
 
-    # --- Org unit resolution ---
-    org_unit = state.get("org_unit", {})
-    org_label = org_unit.get("label", "National")
-    org_uid = org_unit.get("uid", "")
-
-    # Check if the UID looks like a placeholder (fabricated from the label)
-    needs_resolution = (
-        not org_uid
-        or org_uid == org_label.upper().replace(" ", "_")
-        or not _looks_like_dhis2_uid(org_uid)
-    )
-
-    if needs_resolution and org_label.lower() not in {"national", "federal"}:
-        try:
-            resolved = await _resolve_org_unit_from_db_or_live_api(
-                org_label, settings, token=state.get("_dhis2_token")
-            )
-            if resolved:
-                state["org_unit"] = resolved
-                logger.info(
-                    "org_unit_resolved",
-                    extra={
-                        "original_label": org_label,
-                        "resolved_uid": resolved["uid"],
-                        "resolved_label": resolved["label"],
-                        "resolved_level": resolved["level"],
-                    },
-                )
-            else:
-                # Index reachable but no match for an explicitly named location.
-                # Do not block with a clarification. Let the analytics builder fall back to USER_ORGUNIT.
-                logger.warning(
-                    "org_unit_not_found_proceeding",
-                    extra={"label": org_label, "using_placeholder": org_uid},
-                )
-        except Exception as exc:
-            # Infra failure — leave the org unit as-is and let the analytics
-            # builder fall back to USER_ORGUNIT; do not block with a clarification.
-            logger.warning("org_unit_resolve_failed", extra={"label": org_label, "error": str(exc)})
-
     # --- Disaggregation resolution ---
+    # Category breakdowns ("by age", "by sex") are only meaningful for data
+    # elements whose category combo contains that category, so match the
+    # user's word against the chosen data element's own categories first.
+    raw_disaggs = list(state.get("disaggregations") or [])
+    for m_ in re.finditer(r"\b(?:by|per|and|with)\s+(age(?:\s+group)?|sex|gender)\b|\b(age|sex|gender)[\s-]+(?:group|disaggregat\w*|breakdown)",
+                          _last_user_text(state), re.I):
+        term = (m_.group(1) or m_.group(2) or "").lower()
+        if term and term not in [str(d).lower() for d in raw_disaggs]:
+            raw_disaggs.append(term)
     resolved_disaggregations = []
-    for d in (state.get("disaggregations") or []):
+    for d in raw_disaggs:
         if d == "ou_children":
             resolved_disaggregations.append(d)
-        else:
+            continue
+        de_cat = None
+        try:
+            de_cat = await _category_from_data_elements(str(d), state, settings)
+        except Exception as exc:
+            logger.warning("de_category_lookup_failed", extra={"term": d, "error": str(exc)})
+        if de_cat == "NOT_APPLICABLE":
+            state.setdefault("resolution_notes", []).append(
+                f"The selected data item can't be broken down by {d} in this DHIS2 instance, so totals are shown."
+            )
+            continue
+        if de_cat:
+            if de_cat["uid"] not in resolved_disaggregations:
+                resolved_disaggregations.append(de_cat["uid"])
+                state.setdefault("category_labels", {})[de_cat["uid"]] = de_cat["label"]
+            logger.info("category_resolved_from_de", extra={"term": d, "uid": de_cat["uid"], "label": de_cat["label"]})
+            continue
+        if True:
             # It's a demographic category string
             from backend.app.db.metadata_index import search_category_by_name
             from backend.app.db.session import get_db_session
@@ -534,6 +584,14 @@ async def _resolve_org_unit_from_db_or_live_api(
             return resolved
     except Exception as exc:
         logger.warning("local_org_unit_db_search_failed", extra={"label": label, "error": str(exc)})
+
+    # 1b. Misspellings ("Kenama", "Bombli"): closest org unit name in the index.
+    try:
+        fuzzy = await _fuzzy_org_unit(label, settings)
+        if fuzzy:
+            return fuzzy
+    except Exception as exc:
+        logger.warning("fuzzy_org_unit_failed", extra={"label": label, "error": str(exc)})
 
     # 2. Try live DHIS2 API
     if settings.dhis2_service_account_user or token:
@@ -876,4 +934,340 @@ async def _pgvector_resolve_category(
                 }
     except Exception as exc:
         logger.warning("pgvector_resolve_category_failed", extra={"term": term, "error": str(exc)})
+    return None
+
+
+# ---------------------------------------------------------------------------
+# Breakdown level + expert metric resolution
+# ---------------------------------------------------------------------------
+
+def _last_user_text(state: AgentState) -> str:
+    for msg in reversed(state.get("messages") or []):
+        if msg.get("role") == "user":
+            return str(msg.get("content") or "")
+    return ""
+
+
+def _context_messages(state: AgentState) -> list[str]:
+    """Earlier turns (user questions and the last assistant reply) for follow-ups."""
+    msgs = state.get("messages") or []
+    out: list[str] = []
+    for msg in msgs[:-1][-4:]:
+        content = str(msg.get("content") or "").strip()
+        if not content:
+            continue
+        role = "assistant" if msg.get("role") == "assistant" else "user"
+        out.append(f"{role}: {content[:300]}")
+    return out
+
+
+async def _apply_breakdown_level(state: AgentState, settings: Settings) -> None:
+    from backend.app.agent.resolution import org_levels, parse_breakdown_level, level_name, _plural as _p
+
+    org = state.get("org_unit") or {}
+    levels = await org_levels(settings, token=state.get("_dhis2_token"))
+    label_low = (org.get("label") or "").strip().lower()
+    level_words = {l["name"].lower() for l in levels or []} | {_p(l["name"].lower()) for l in levels or []}
+    if label_low in level_words and not _looks_like_dhis2_uid(org.get("uid") or ""):
+        # The parser took "district" in "by district" for a place name.
+        org["label"] = "National"
+        org["uid"] = "UNRESOLVED"
+    org_level = int(org.get("level") or 1)
+    if (org.get("label") or "").lower() in {"national", "federal"} or not _looks_like_dhis2_uid(org.get("uid") or ""):
+        # National, or a place that did not resolve: analytics uses the user's
+        # top org unit (USER_ORGUNIT), so breakdowns count from level 1.
+        org_level = 1
+        org["level"] = 1
+    disaggs = list(state.get("disaggregations") or [])
+    wanted = parse_breakdown_level(_last_user_text(state), levels)
+    if wanted is None and "ou_children" in disaggs:
+        wanted = org_level + 1
+    if wanted is not None and wanted > org_level:
+        org["breakdown_level"] = wanted
+        org["breakdown_level_name"] = level_name(wanted, levels)
+        if "ou_children" not in disaggs:
+            disaggs.append("ou_children")
+    elif wanted is not None and wanted <= org_level and "ou_children" in disaggs:
+        # e.g. "by district" when the place asked for already is a district.
+        disaggs = [d for d in disaggs if d != "ou_children"]
+    org["level_name"] = level_name(org_level, levels)
+    state["org_unit"] = org
+    state["disaggregations"] = disaggs
+
+
+def _period_text(state: AgentState) -> str:
+    return ", ".join(state.get("periods") or []) or "THIS_YEAR"
+
+
+def _place_text(state: AgentState) -> str:
+    org = state.get("org_unit") or {}
+    label = org.get("label") or "National"
+    if label.lower() == "national":
+        label = "whole country (national)"
+    bl = org.get("breakdown_level_name")
+    return f"{label}, broken down by {bl}" if bl else label
+
+
+async def _expert_resolve(state: AgentState, settings: Settings) -> dict:
+    """Resolve every not-yet-certain metric with rank -> probe -> judge.
+
+    Returns {"status": "ok" | "skip" | "clarify" | "not_available", ...}.
+    "skip" means the catalogue is unavailable and the legacy cascade runs.
+    """
+    from backend.app.agent import resolution as R
+    from backend.app.dhis2.analytics import ou_dimension
+
+    metrics = state.get("metrics") or []
+    cat = await R.load_catalogue(settings)
+    if not cat["items"]:
+        return {"status": "skip"}
+
+    user_text = _last_user_text(state)
+    org = state.get("org_unit") or {}
+    # Only strip the place name from the question when it resolved to a real org
+    # unit; a mis-parsed "place" (e.g. the indicator name) must not be erased.
+    org_stop = (
+        set(R.tokens(org.get("label") or "")) | set(R.tokens(org.get("original_label") or ""))
+        if _looks_like_dhis2_uid(org.get("uid") or "") else set()
+    )
+    q_user = [
+        w for w in R.content_tokens(user_text, org_stop)
+        if not (w in cat["ou_tokens"] and w not in cat["vocab"])
+    ]
+
+    def exact_is_best(m: dict) -> bool:
+        """A typed exact name is trusted only if no other item fits the user's words better
+        ("BCG doses were given" should not lock onto "BCG doses" over "BCG doses given")."""
+        if not q_user:
+            return True
+        by_uid = {it["uid"]: it for it in cat["items"]}
+        it = by_uid.get(m.get("uid"))
+        if it is None:
+            return False
+        mine = R.score_item(q_user, it, cat)
+        top = R.rank_candidates([(q_user, 1.0)], cat, limit=1)
+        return not top or top[0]["uid"] == it["uid"] or top[0]["score"] <= mine + 0.05
+
+    todo = [
+        i for i, m in enumerate(metrics)
+        if not (m.get("uid_confidence", 0) >= 0.97 and _looks_like_dhis2_uid(m.get("uid") or "")
+                and exact_is_best(m))
+    ]
+    if not todo:
+        return {"status": "ok"}
+    unknown = R.unknown_tokens(q_user, cat)
+
+    client = None
+    if settings.dhis2_service_account_user or state.get("_dhis2_token"):
+        from backend.app.dhis2.client import DHIS2Client
+        client = DHIS2Client(settings, token=state.get("_dhis2_token"))
+    ou = ou_dimension(state)
+    pe = ";".join(state.get("periods") or ["THIS_YEAR"])
+    use_llm = settings.llm_provider != "mock"
+    context = _context_messages(state)
+
+    async def one(i: int) -> dict:
+        m = metrics[i]
+        label = str(m.get("label") or "")
+        q_label = R.content_tokens(label, org_stop)
+        queries = [(q_user, 1.0), (q_label, 0.95)]
+        for t in (m.get("search_terms") or [])[:4]:
+            queries.append((R.content_tokens(str(t), org_stop), 0.85))
+        pool = R.rank_candidates(queries, cat, limit=40)
+        for c in pool:
+            c["user_score"] = R.score_item(q_user, {"tokens": {*R.tokens(c["label"])},
+                                                     "name_tokens": R.tokens(c["label"])}, cat) if q_user else c["score"]
+        has = None
+        if client is not None and pool:
+            has = await R.probe_data(client, [c["uid"] for c in pool], ou, pe)
+        for c in pool:
+            c["has_data"] = None if has is None else (has.get(c["uid"]) is not None)
+            if has is not None and has.get(c["uid"]) is not None:
+                c["data_total"] = has[c["uid"]]
+        if has is None:
+            shown = R.diversify(pool, 12)
+        else:
+            with_data = R.diversify([c for c in pool if c["has_data"]], 9)
+            without = [c for c in pool if not c["has_data"]][: max(3, 12 - len(with_data))]
+            shown = sorted(with_data + without, key=lambda c: -c["score"])[:12]
+        verdict = None
+        if use_llm and shown:
+            verdict = await R.llm_judge(user_text, label, shown, _place_text(state), _period_text(state),
+                                        context, settings)
+        if verdict is None:
+            rescored = [{**c, "score": c["user_score"] if q_user else c["score"]} for c in shown]
+            verdict = R.deterministic_judge(q_user, rescored, unknown)
+        verdict["candidates"] = shown
+        verdict["label"] = label
+        return verdict
+
+    verdicts = await asyncio.gather(*(one(i) for i in todo))
+
+    ambiguous = [v for v in verdicts if v["decision"] == "ambiguous"]
+    missing = [v for v in verdicts if v["decision"] == "not_available"]
+    if ambiguous:
+        return {"status": "clarify", "question": _ambiguous_question(ambiguous[0])}
+    if missing and len(missing) == len(metrics):
+        return {"status": "not_available", "message": _not_available_message(missing, state)}
+
+    notes: list[str] = []
+    new_metrics = list(metrics)
+    drop: set[int] = set()
+    for i, v in zip(todo, verdicts):
+        if v["decision"] == "not_available":
+            drop.add(i)
+            notes.append(f"“{v.get('requested_concept') or v['label']}” is not available in this DHIS2 instance, so it is left out.")
+            continue
+        cands = v["candidates"]
+        chosen = cands[v["choice"] - 1]
+        alts = [cands[j - 1] for j in v.get("alternatives") or [] if cands[j - 1].get("has_data") is not False]
+        new_metrics[i] = {
+            **{k: val for k, val in metrics[i].items() if k not in {"search_terms"}},
+            "label": chosen["label"],
+            "uid": chosen["uid"],
+            "uid_confidence": 0.95,
+            "object_type": chosen["object_type"],
+            "requested_label": metrics[i].get("label"),
+            "resolved_by": v.get("by"),
+            "has_data": chosen.get("has_data"),
+            "fallbacks": [
+                {"label": a["label"], "uid": a["uid"], "object_type": a["object_type"]} for a in alts[:3]
+            ],
+        }
+        logger.info("expert_resolved", extra={
+            "requested": metrics[i].get("label"), "chosen": chosen["label"], "uid": chosen["uid"],
+            "by": v.get("by"), "has_data": chosen.get("has_data"), "reason": v.get("reason"),
+        })
+    state["metrics"] = [m for j, m in enumerate(new_metrics) if j not in drop]
+    if notes:
+        state.setdefault("resolution_notes", []).extend(notes)
+    return {"status": "ok"}
+
+
+def _option_line(c: dict) -> str:
+    from backend.app.agent.resolution import TYPE_LABEL
+    tail = " (no data for this place and period)" if c.get("has_data") is False else ""
+    return f"{c['label']} ({TYPE_LABEL.get(c['object_type'], c['object_type'])}){tail}"
+
+
+def _pick_options(v: dict, n: int = 5) -> list[dict]:
+    cands = v.get("candidates") or []
+    idx = [j for j in (v.get("options") or []) if 1 <= j <= len(cands)]
+    if len(idx) < 3:
+        from backend.app.agent.resolution import tokens
+        ranked = sorted(range(1, len(cands) + 1),
+                        key=lambda j: (-(cands[j - 1].get("has_data") is True), -cands[j - 1]["score"]))
+        firsts = {(tokens(cands[j - 1]["label"]) or [""])[0] for j in idx}
+        # First pass: one option per name family; second pass fills up.
+        for pass_ in (0, 1):
+            for j in ranked:
+                if len(idx) >= n:
+                    break
+                first = (tokens(cands[j - 1]["label"]) or [""])[0]
+                if j in idx or (pass_ == 0 and first in firsts):
+                    continue
+                idx.append(j)
+                firsts.add(first)
+    return [cands[j - 1] for j in idx[:n]]
+
+
+def _ambiguous_question(v: dict) -> str:
+    concept = v.get("requested_concept") or v.get("label") or "that"
+    opts = _pick_options(v, 5)
+    lines = "\n".join(f"{k}. {_option_line(c)}" for k, c in enumerate(opts, 1))
+    return (
+        f"“{concept}” could mean several different measures in this DHIS2 instance. Which one do you want?\n\n"
+        f"{lines}\n\nReply with the name (or number), and I'll run it."
+    )
+
+
+def _not_available_message(missing: list[dict], state: AgentState) -> str:
+    parts = []
+    for v in missing:
+        concept = v.get("requested_concept") or v.get("label") or "That"
+        opts = _pick_options(v, 4)
+        msg = (
+            f"**{concept}** isn't available in this DHIS2 instance: no data element, indicator or "
+            f"program indicator here measures it, so I haven't substituted anything else."
+        )
+        if opts:
+            msg += "\n\nClosest items that do exist here:\n" + "\n".join(f"- {_option_line(c)}" for c in opts)
+        parts.append(msg)
+    return "\n\n".join(parts) + "\n\nAsk about one of those, or type the exact name of the data item you need."
+
+
+_CAT_SYNONYMS = {
+    "sex": {"sex", "gender", "male", "female"},
+    "gender": {"sex", "gender", "male", "female"},
+    "age": {"age", "year", "month", "under", "child", "paediatric"},
+    "age group": {"age", "year", "month", "under", "paediatric"},
+}
+_DE_CATS_CACHE: dict[str, list[dict]] = {}
+
+
+async def _category_from_data_elements(term: str, state: AgentState, settings: Settings):
+    """Category of the selected data element(s) that matches a breakdown word.
+
+    Returns {"uid","label"}, "NOT_APPLICABLE" when the selected items are
+    indicators / program indicators or have no such category, or None when the
+    lookup could not run (legacy search then takes over).
+    """
+    from backend.app.agent.resolution import tokens
+
+    metrics = [m for m in state.get("metrics") or [] if _looks_like_dhis2_uid(m.get("uid") or "")]
+    if not metrics:
+        return None
+    want = _CAT_SYNONYMS.get(term.lower().strip(), set(tokens(term)))
+    des = [m for m in metrics if m.get("object_type") == "dataElement"]
+    if not des:
+        return "NOT_APPLICABLE"
+    if not (settings.dhis2_service_account_user or state.get("_dhis2_token")):
+        return None
+    from backend.app.dhis2.client import DHIS2Client
+    client = DHIS2Client(settings, token=state.get("_dhis2_token"))
+    for m in des:
+        uid = m["uid"]
+        if uid not in _DE_CATS_CACHE:
+            raw = await client.get(f"/api/dataElements/{uid}.json",
+                                   params={"fields": "categoryCombo[categories[id,name]]"})
+            _DE_CATS_CACHE[uid] = list(((raw.get("categoryCombo") or {}).get("categories")) or [])
+        for c in _DE_CATS_CACHE[uid]:
+            if c.get("name", "").lower() == "default":
+                continue
+            if set(tokens(c.get("name", ""))) & want:
+                return {"uid": c["id"], "label": c["name"]}
+    return "NOT_APPLICABLE"
+
+
+async def _fuzzy_org_unit(label: str, settings: Settings) -> dict | None:
+    """Closest org unit by spelling (difflib ratio >= 0.8), shallower level first."""
+    import difflib
+    from sqlalchemy import text as sa_text
+    from backend.app.db.session import get_db_session
+
+    name = re.sub(r"\b(district|chiefdom|facility|province|region)\b", "", label, flags=re.I).strip().lower()
+    if len(name) < 3:
+        return None
+    table = "metadata_index" if settings.is_postgres else "metadata_index_fts"
+    async with get_db_session() as session:
+        rows = (await session.execute(sa_text(
+            f"SELECT uid, name, raw_metadata FROM {table} WHERE object_type = 'orgUnit'"
+        ))).fetchall()
+    best = None
+    for uid, n, raw in rows:
+        nm = " ".join(str(n or "").split())
+        r = difflib.SequenceMatcher(None, name, nm.lower()).ratio()
+        if r < 0.8:
+            continue
+        level = 9
+        try:
+            level = int((json.loads(raw) if isinstance(raw, str) else (raw or {})).get("level", 9))
+        except Exception:
+            pass
+        key = (r, -level)
+        if best is None or key > best[0]:
+            best = (key, {"label": nm, "uid": uid, "level": level if level != 9 else 2})
+    if best:
+        logger.info("org_unit_fuzzy_resolved", extra={"label": label, "resolved": best[1]["label"]})
+        return best[1]
     return None

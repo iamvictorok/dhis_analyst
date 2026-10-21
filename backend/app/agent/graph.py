@@ -187,6 +187,14 @@ async def run_agent_stream(
             yield sse("done")
             return
 
+        # --- Requested concept is not in this instance: say so, never substitute ---
+        if state.get("not_available_message"):
+            logger.info("concept_not_available", extra={"session_id": state["session_id"]})
+            for chunk in _chunk(state["not_available_message"], 64):
+                yield sse("token", {"text": chunk})
+            yield sse("done")
+            return
+
         # --- Pre-flight: check for UNRESOLVED metrics ---
         unresolved = [
             m for m in state["metrics"]
@@ -304,6 +312,10 @@ async def run_agent_stream(
                 })
                 # Non-fatal — continue with empty data
 
+        # --- Empty result: try the next-best candidates for the same concept ---
+        if not state.get("fetch_error") and not (state.get("dhis2_data") or {}).get("rows"):
+            state = await _try_fallback_candidates(state, settings)
+
         # --- Web enrichment ---
         try:
             state = await _timed_node("enrich_web", enrich_web, state, settings)
@@ -337,6 +349,9 @@ async def run_agent_stream(
             return
             
         if mode in ("report", "dashboard", "presentation", "export", "map"):
+            data_used = _data_used_text(state)
+            if data_used:
+                yield sse("token", {"text": data_used + "\n\n"})
             yield sse("report_html", {"html": _no_data_html(state)})
             logger.info("agent_done_no_data", extra={"session_id": state["session_id"], "mode": mode})
             yield sse("done")
@@ -356,6 +371,9 @@ async def run_agent_stream(
     if source_tracker.get("mode") == "cached":
         cached_label = failover.snapshot_label(settings)
 
+    data_used = _data_used_text(state) if state["requires_data"] else ""
+    if data_used and mode != "conversational":
+        yield sse("token", {"text": data_used + "\n\n"})
     if map_requested:
         yield sse("token", {"text": "Map view is coming soon — showing a chart instead.\n\n"})
     if cached_label and mode != "conversational":
@@ -402,6 +420,8 @@ async def run_agent_stream(
     else:
         # Conversational — stream token by token
         answer = state.get("active_conversational_response") or ""
+        if data_used:
+            answer = answer.rstrip() + "\n\n" + data_used
         if cached_label:
             answer = f"_⚠️ {cached_label} (DHIS2 demo snapshot — the live server is unreachable)._\n\n" + answer
         for chunk in _chunk(answer, 64):
@@ -501,3 +521,115 @@ def _no_data_html(state: AgentState) -> str:
         f"</ul>"
         f"<p>Please verify the indicator, location, and time period, then try again.</p>"
     )
+
+
+_TYPE_LABEL = {
+    "indicator": "indicator",
+    "dataElement": "data element",
+    "programIndicator": "program indicator",
+    "reportingRate": "reporting rate",
+}
+
+
+async def _try_fallback_candidates(state: AgentState, settings: Settings, limit: int = 3) -> AgentState:
+    """0 rows for the chosen item: try up to ``limit`` alternates for the SAME concept.
+
+    Alternates come from the resolver (judged to measure the same thing). The
+    substitution is recorded in ``resolution_notes`` so the answer says it.
+    """
+    metrics = state.get("metrics") or []
+    if len(metrics) != 1:
+        return state
+    original = metrics[0]
+    tried = 0
+    for alt in (original.get("fallbacks") or [])[:limit]:
+        tried += 1
+        trial = {**original, **alt, "uid_confidence": 0.9, "fallbacks": []}
+        state["metrics"] = [trial]
+        try:
+            state = await _timed_node("fetch_dhis2_fallback", fetch_dhis2, state, settings)
+        except Exception as exc:
+            logger.info("fallback_candidate_failed", extra={"uid": alt.get("uid"), "error": str(exc)[:200]})
+            continue
+        if (state.get("dhis2_data") or {}).get("rows"):
+            state.setdefault("resolution_notes", []).append(
+                f"“{original.get('label')}” has no data for this place and period, so I used the next-best "
+                f"match for the same measure: “{alt.get('label')}”."
+            )
+            logger.info("fallback_candidate_used", extra={"from": original.get("uid"), "to": alt.get("uid")})
+            return state
+    state["metrics"] = [original]
+    if tried:
+        state.setdefault("resolution_notes", []).append(
+            f"No data for “{original.get('label')}” or {tried} similar item(s) for this place and period."
+        )
+    return state
+
+
+def _data_used_text(state: AgentState) -> str:
+    """One short line an expert can check: data item(s) + UID, org unit + level, period."""
+    metrics = [m for m in state.get("metrics") or [] if m.get("uid") and m.get("uid") != "UNRESOLVED"]
+    if not metrics:
+        return ""
+    items = "; ".join(
+        f"{m.get('label')} ({_TYPE_LABEL.get(m.get('object_type'), m.get('object_type') or 'item')} `{m.get('uid')}`)"
+        for m in metrics
+    )
+    org = state.get("org_unit") or {}
+    label = org.get("label") or "National"
+    uid = org.get("uid") or ""
+    org_txt = label
+    if uid and re.match(r"^[A-Za-z][A-Za-z0-9]{10}$", uid):
+        org_txt += f" (`{uid}`)"
+    elif label.lower() in {"national", "federal"}:
+        org_txt = "National (your top org unit)"
+    else:
+        org_txt = f"your top org unit (USER_ORGUNIT), because “{label}” was not recognised as a place in this instance"
+    lvl_name = org.get("level_name")
+    if lvl_name and uid and re.match(r"^[A-Za-z][A-Za-z0-9]{10}$", uid):
+        org_txt += f", {lvl_name.lower()} level"
+    if org.get("breakdown_level"):
+        org_txt += f", broken down by {org.get('breakdown_level_name') or 'level'} (LEVEL-{org['breakdown_level']})"
+    elif "ou_children" in (state.get("disaggregations") or []):
+        org_txt += ", broken down one level down"
+    cats = state.get("category_labels") or {}
+    cat_txt = ""
+    used_cats = [cats.get(d, d) for d in state.get("disaggregations") or [] if d != "ou_children"]
+    if used_cats:
+        cat_txt = " · **Disaggregated by:** " + ", ".join(used_cats)
+    periods = ", ".join(state.get("periods") or [])
+    pe_names = _period_names(state)
+    if pe_names:
+        periods += f" → {pe_names}"
+    line = f"**Data used:** {items} · **Org unit:** {org_txt} · **Period:** {periods}{cat_txt}"
+    notes = state.get("resolution_notes") or []
+    if notes:
+        line += "\n\n" + "\n".join(f"_{n}_" for n in notes)
+    return line
+
+
+def _period_names(state: AgentState) -> str:
+    meta = ((state.get("dhis2_data") or {}).get("metadata") or {}).get("raw_metadata") or {}
+    items = meta.get("items") or {}
+    # Periods present in the returned rows, in order.
+    seen: list[str] = []
+    for row in (state.get("dhis2_data") or {}).get("rows") or []:
+        if len(row) > 1 and row[1] not in seen:
+            seen.append(row[1])
+    if not seen:
+        return ""
+    dim_pe = (meta.get("dimensions") or {}).get("pe") or []
+    if dim_pe:
+        order = []
+        for p in dim_pe:
+            name = items.get(p, {}).get("name", p) if isinstance(items.get(p), dict) else p
+            for cand in (p, name):
+                if cand in seen and cand not in order:
+                    order.append(cand)
+        order += [p for p in seen if p not in order]
+    else:
+        order = seen
+    names = [items.get(p, {}).get("name", p) if isinstance(items.get(p), dict) else p for p in order]
+    if len(names) <= 3:
+        return ", ".join(str(n) for n in names)
+    return f"{names[0]} … {names[-1]} ({len(names)} periods with data)"

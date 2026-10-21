@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import asyncio
 import hmac
+import os
 import logging
 import time
 from contextlib import asynccontextmanager
@@ -23,6 +24,7 @@ from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 
 from backend.config import Settings, get_settings
+from backend.version import BUILD_ID
 from backend.app.ratelimit import RateLimiter, create_rate_limiter
 from backend.app.agent.graph import run_agent_stream
 from backend.app.db.session import init_db, get_session
@@ -360,6 +362,8 @@ async def health(settings: Settings = Depends(get_settings)) -> dict:
         "evidence_fusion": settings.evidence_fusion,
         "llm_provider": settings.llm_provider,
         "dhis2": {"mode": st["mode"], "snapshot_mode": st["snapshot_mode"]},
+        "build": BUILD_ID,
+        "commit": (os.environ.get("RENDER_GIT_COMMIT") or "")[:7],
     }
 
 
