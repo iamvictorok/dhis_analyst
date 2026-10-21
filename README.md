@@ -32,6 +32,27 @@ For a hot-reloading development experience:
    ```
 3. Open `http://localhost:5173/` in your browser. It will proxy requests to the backend server.
 
+## Run with a hosted model (Gemini) against the public DHIS2 demo
+
+Copy `.env.example` to `.env` and set:
+
+```env
+DEPLOYMENT_MODE=standalone
+DHIS2_BASE_URL=https://play.im.dhis2.org/stable-2-41-10   # check it is up: /api/system/info.json
+DHIS2_SERVICE_ACCOUNT_USER=admin                          # public demo credentials only
+DHIS2_SERVICE_ACCOUNT_PASS=district
+LLM_PROVIDER=gemini
+LLM_MODEL=gemini/gemini-flash-latest                      # or another current Gemini model
+LLM_API_KEY=<your Google AI Studio key>                   # never commit this
+LLM_TIMEOUT_SECONDS=90
+JWT_SECRET=<long random string>
+STANDALONE_ACCESS_CODE=<password for anyone you share a hosted URL with>
+```
+
+Then rebuild the frontend once (`cd frontend && npm install && npm run build`) and start the backend.
+Behind a corporate/HTTP proxy, also set `DISABLE_AIOHTTP_TRANSPORT=True` (LiteLLM's default
+aiohttp transport ignores `HTTPS_PROXY`). The app only issues GET requests to DHIS2.
+
 ## Privacy Defaults
 
 - No LLM or Tavily request is made by default.
