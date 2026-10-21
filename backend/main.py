@@ -60,7 +60,7 @@ _rate_limiter: RateLimiter | None = None
 # Paths exempt from rate limiting: health check, SPA entry, and static assets
 # (SPA loads issue several of these per page; counting them starves real users
 # behind a shared NAT IP). API/auth routes are always limited.
-_RATE_LIMIT_EXEMPT_EXACT = {"/health", "/"}
+_RATE_LIMIT_EXEMPT_EXACT = {"/health", "/", "/api/dhis2/status"}
 _RATE_LIMIT_EXEMPT_PREFIXES = ("/frontend", "/assets")
 _RATE_LIMIT_EXEMPT_EXTS = (
     ".js", ".css", ".svg", ".ico", ".png", ".woff2", ".woff", ".ttf", ".map",
@@ -159,6 +159,23 @@ async def _temp_file_cleanup_loop():
             logger.warning("temp_file_cleanup_failed", extra={"error": str(exc)})
 
 
+async def _dhis2_health_loop():
+    """Re-check DHIS2 instances periodically so the app moves back to the
+    primary as soon as it recovers (and to fallback/cached when it drops)."""
+    settings = get_settings()
+    if not settings.dhis2_service_account_user:
+        return
+    from backend.app.dhis2 import failover
+
+    interval = max(15, settings.dhis2_health_interval_seconds)
+    while True:
+        await asyncio.sleep(interval)
+        try:
+            await failover.probe(settings)
+        except Exception as exc:
+            logger.warning("dhis2_health_probe_error", extra={"error": str(exc)})
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global _rate_limiter
@@ -170,27 +187,22 @@ async def lifespan(app: FastAPI):
     
     await init_db()
 
-    # --- DHIS2 connectivity check ---
+    # --- DHIS2 connectivity check + source selection (live/fallback/cached) ---
     if settings.dhis2_service_account_user:
+        from backend.app.dhis2 import failover
         try:
-            from backend.app.dhis2.client import DHIS2Client
-            client = DHIS2Client(settings)
-            info = await client.health_check()
+            st = await failover.probe(settings)
             logger.info(
-                "dhis2_health_ok",
-                extra={
-                    "version": info.get("version"),
-                    "revision": info.get("revision"),
-                    "base_url": settings.dhis2_base_url,
-                },
+                "dhis2_source_selected",
+                extra={"mode": st["mode"], "base_url": st["base_url"], "instances": st["instances"]},
             )
+            if st["mode"] == "down":
+                logger.warning(
+                    "dhis2_health_failed: no DHIS2 instance is reachable and the demo "
+                    "snapshot is disabled or missing — data queries will fail."
+                )
         except Exception as exc:
-            logger.warning(
-                "dhis2_health_failed: DHIS2 instance is unreachable — "
-                "data queries will fail until this is fixed. "
-                f"URL: {settings.dhis2_base_url}",
-                extra={"error": str(exc)},
-            )
+            logger.warning("dhis2_health_probe_error", extra={"error": str(exc)})
 
     # --- First line of defense: prime metadata index at startup ---
     if settings.dhis2_service_account_user:
@@ -203,10 +215,11 @@ async def lifespan(app: FastAPI):
 
     sync_task = asyncio.create_task(_metadata_sync_loop())
     cleanup_task = asyncio.create_task(_temp_file_cleanup_loop())
+    health_task = asyncio.create_task(_dhis2_health_loop())
 
     logger.info("startup", extra={"deployment_mode": settings.deployment_mode})
     yield
-    for task in (sync_task, cleanup_task):
+    for task in (sync_task, cleanup_task, health_task):
         task.cancel()
         try:
             await task
@@ -336,12 +349,46 @@ async def current_identity(
 
 @app.get("/health")
 async def health(settings: Settings = Depends(get_settings)) -> dict:
+    """Liveness for Render/Docker. Always 200 while the process serves
+    requests; reports the last known DHIS2 source without probing."""
+    from backend.app.dhis2 import failover
+
+    st = failover.status(settings)
     return {
         "status": "ok",
         "deployment_mode": settings.deployment_mode,
         "evidence_fusion": settings.evidence_fusion,
         "llm_provider": settings.llm_provider,
+        "dhis2": {"mode": st["mode"], "snapshot_mode": st["snapshot_mode"]},
     }
+
+
+_DEMO_QUESTIONS_FILE = Path(__file__).resolve().parent / "demo_snapshot" / "demo_questions.json"
+
+
+@app.get("/api/demo/questions")
+async def demo_questions(identity: Identity = Depends(current_identity)) -> list[dict]:
+    """Suggested-question chips. Clicking one sends the question through the
+    normal agent pipeline (nothing is pre-answered)."""
+    import json as _json
+
+    try:
+        return _json.loads(_DEMO_QUESTIONS_FILE.read_text(encoding="utf-8"))
+    except Exception as exc:
+        logger.warning("demo_questions_unavailable", extra={"error": str(exc)})
+        return []
+
+
+@app.get("/api/dhis2/status")
+async def dhis2_status(settings: Settings = Depends(get_settings)) -> dict:
+    """Source behind the header status dot: live | fallback | cached | down.
+
+    Public on purpose (the login screen can show it too); contains only the
+    public instance URLs and the snapshot date, never credentials.
+    """
+    from backend.app.dhis2 import failover
+
+    return failover.status(settings)
 
 
 @app.post("/api/chat")
@@ -666,6 +713,10 @@ async def login(request: LoginRequest, settings: Settings = Depends(get_settings
     # Replace this block with your credential store validation.
     if not request.username or not request.password:
         raise HTTPException(status_code=422, detail="username and password are required")
+
+    if settings.is_hosted and not settings.standalone_access_code.strip():
+        # Startup refuses this config; this is a belt-and-braces guard.
+        raise HTTPException(status_code=503, detail="Login is disabled: access code not configured.")
 
     if settings.standalone_access_code and not hmac.compare_digest(
         request.password.encode(), settings.standalone_access_code.encode()

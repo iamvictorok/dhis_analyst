@@ -134,8 +134,55 @@ class DHIS2Client:
         return await self._get("/api/system/info.json")
 
     async def _get(self, path: str, params: dict[str, Any] | None = None) -> dict[str, Any]:
+        """GET through the live -> fallback -> cached-snapshot failover.
+
+        Per-user PAT requests (DHIS2 app mode) always go to the configured
+        primary instance: a user's token is not valid on other instances, and
+        the demo snapshot only stands in for the shared service account.
+        """
+        from backend.app.dhis2 import failover
+
+        if self.token:
+            return await self._http_get(self._base_url, path, params)
+
+        mode, base = failover.current_target(self.settings)
+        if mode == "cached":
+            payload = failover.get_store(self.settings).lookup(path, params)
+            failover.note_source("cached", None)
+            logger.info("dhis2_snapshot_hit", extra={"path": path})
+            return payload
+
+        try:
+            payload = await self._http_get(base, path, params)
+        except Exception as exc:
+            if not _is_outage(exc):
+                raise
+            logger.warning(
+                "dhis2_outage_detected",
+                extra={"base_url": base, "path": path, "error_type": type(exc).__name__},
+            )
+            await failover.probe(self.settings)
+            new_mode, new_base = failover.current_target(self.settings)
+            if new_mode == "cached":
+                payload = failover.get_store(self.settings).lookup(path, params)
+                failover.note_source("cached", None)
+                return payload
+            if new_base == base:
+                raise
+            payload = await self._http_get(new_base, path, params)
+            failover.note_source(new_mode, new_base)
+            return payload
+
+        failover.note_source(mode, base)
+        recorder = failover.get_recorder(self.settings)
+        if recorder is not None:
+            recorder.record(base, path, params, payload)
+        return payload
+
+    async def _http_get(self, base_url: str, path: str, params: dict[str, Any] | None = None) -> dict[str, Any]:
         """GET with bounded retries on transient transport and server errors."""
         kwargs = self._build_client_kwargs()
+        kwargs["base_url"] = base_url
         last_exc: Exception | None = None
 
         for attempt in range(MAX_ATTEMPTS):
@@ -212,10 +259,10 @@ class DHIS2Client:
                     logger.error(
                         "dhis2_base_url_wrong: Got HTML 404 from nginx — "
                         "DHIS2_BASE_URL likely points at a frontend wrapper, not the API host. "
-                        f"Current base: {self._base_url}",
+                        f"Current base: {base_url}",
                         extra={
                             "path": path,
-                            "full_url": f"{self._base_url}{path}",
+                            "full_url": f"{base_url}{path}",
                             "status": 404,
                             "hint": "Check DHIS2_BASE_URL in .env — try the play.im.dhis2.org host",
                         },
@@ -226,7 +273,7 @@ class DHIS2Client:
                         f"{dhis2_error_msg or body}",
                         extra={
                             "path": path,
-                            "full_url": f"{self._base_url}{path}",
+                            "full_url": f"{base_url}{path}",
                             "params_shape": _params_shape(params),
                             "status": exc.response.status_code,
                             "dhis2_message": dhis2_error_msg,
@@ -243,6 +290,21 @@ class DHIS2Client:
                 raise
 
         raise last_exc or RuntimeError(f"DHIS2 request failed after {MAX_ATTEMPTS} attempts: {path}")
+
+
+def _is_outage(exc: Exception) -> bool:
+    """True for failures that mean "this instance is down", not "bad request"."""
+    if isinstance(exc, httpx.TransportError):
+        return True
+    if isinstance(exc, httpx.HTTPStatusError):
+        code = exc.response.status_code
+        if code in RETRYABLE_STATUS_CODES or code == 401:
+            return True
+        # An nginx HTML 404 means the whole instance is gone (play instances
+        # are removed when a version is retired); a JSON 404 is a normal miss.
+        return code == 404 and "<html" in exc.response.text[:500].lower()
+    # Login-page HTML (instance reset / credentials changed) also counts.
+    return isinstance(exc, RuntimeError) and "HTML page instead of JSON" in str(exc)
 
 
 async def _sleep_before_retry(attempt: int) -> None:

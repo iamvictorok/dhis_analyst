@@ -140,6 +140,8 @@ async def run_agent_stream(
         },
     )
     pipeline_start = time.monotonic()
+    from backend.app.dhis2 import failover
+    source_tracker = failover.begin_request()
 
     try:
         state = await build_initial_state(request, settings, identity, history, dhis2_token)
@@ -156,6 +158,12 @@ async def run_agent_stream(
         yield sse("error", {"code": "INTENT_FAILED", "user_message": msg, "detail": str(exc)})
         yield sse("done")
         return
+
+    # --- Map mode is not ready for the demo: degrade to a chart, say so ---
+    map_requested = state["output_mode"] == "map"
+    if map_requested:
+        state["output_mode"] = "dashboard"
+        state["viz_types"] = [v for v in state.get("viz_types", []) if v != "map"] or ["bar"]
 
     # --- Clarification gate ---
     if state["clarification_needed"]:
@@ -312,6 +320,10 @@ async def run_agent_stream(
 
         if state["evidence_items"]:
             yield sse("evidence", state["evidence_items"])
+
+        source_event = _data_source_event(source_tracker, settings)
+        if source_event:
+            yield sse("data_source", source_event)
     else:
         logger.info("skipping_data_pipeline", extra={"reason": "requires_data=False", "session_id": state.get("session_id")})
 
@@ -340,6 +352,14 @@ async def run_agent_stream(
         return
 
     mode = state["output_mode"]
+    cached_label = None
+    if source_tracker.get("mode") == "cached":
+        cached_label = failover.snapshot_label(settings)
+
+    if map_requested:
+        yield sse("token", {"text": "Map view is coming soon — showing a chart instead.\n\n"})
+    if cached_label and mode != "conversational":
+        yield sse("token", {"text": f"⚠️ {cached_label} (DHIS2 demo snapshot — the live server is unreachable).\n\n"})
 
     if mode == "dashboard":
         charts = state["active_chart_configs"]
@@ -355,11 +375,24 @@ async def run_agent_stream(
                         "Try rephrasing your request or asking for a table or report.",
             })
     elif mode in ("report", "map"):
-        yield sse("report_html", {"html": state["active_report_html"]})
+        html = state["active_report_html"]
+        if cached_label:
+            html = (
+                '<p class="cached-banner"><strong>' + cached_label
+                + '</strong> — DHIS2 demo snapshot; the live server is unreachable.</p>' + html
+            )
+        yield sse("report_html", {"html": html})
     elif mode == "presentation":
         yield sse("slide_manifest", state["active_slide_manifest"])
     elif mode == "export":
         payload = render_export_payload(state)
+        if cached_label:
+            payload["sources"] = [{
+                "title": f"{cached_label} — DHIS2 demo snapshot (live server unreachable)",
+                "url": "",
+                "confidence": "",
+            }] + list(payload.get("sources") or [])
+            payload.setdefault("metadata", {})["data_source"] = "demo_snapshot"
         yield sse("data_ready", {
             "file_id": None,
             "format": "json",
@@ -369,6 +402,8 @@ async def run_agent_stream(
     else:
         # Conversational — stream token by token
         answer = state.get("active_conversational_response") or ""
+        if cached_label:
+            answer = f"_⚠️ {cached_label} (DHIS2 demo snapshot — the live server is unreachable)._\n\n" + answer
         for chunk in _chunk(answer, 64):
             yield sse("token", {"text": chunk})
             await asyncio.sleep(0)
@@ -382,6 +417,24 @@ async def run_agent_stream(
         },
     )
     yield sse("done")
+
+
+def _data_source_event(tracker: dict, settings: Settings) -> dict | None:
+    """Which DHIS2 source served this answer (for the per-answer badge)."""
+    from backend.app.dhis2 import failover
+
+    mode = tracker.get("mode")
+    if not mode:
+        return None
+    event = {"mode": mode, "base_url": tracker.get("base_url")}
+    if mode == "cached":
+        event["label"] = failover.snapshot_label(settings)
+        event["recorded_at"] = failover.get_store(settings).recorded_at
+    elif mode == "fallback":
+        event["label"] = f"Fallback DHIS2 instance: {tracker.get('base_url')}"
+    else:
+        event["label"] = "Live DHIS2"
+    return event
 
 
 def _chunk(text: str, size: int) -> list[str]:
@@ -398,6 +451,8 @@ def _user_friendly_error(error_msg: str) -> str:
         return "The health indicator could not be correctly identified in the DHIS2 instance. Try rephrasing with more specific terminology (e.g. 'Malaria confirmed cases' instead of 'malaria')."
     if "409" in error_msg and "period" in error_msg.lower():
         return "The requested time period was not recognized by DHIS2."
+    if "not in the offline demo snapshot" in error_msg:
+        return error_msg
     if "No indicators could be resolved" in error_msg:
         return error_msg  # Already user-friendly from our pre-flight check
     if "metadata resolution succeeds" in error_msg:

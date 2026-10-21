@@ -30,3 +30,40 @@ def test_login_accepts_right_access_code():
     s = Settings(jwt_secret="x" * 32, standalone_access_code="hisp-2026")
     out = _run(login(LoginRequest(username="demo", password="hisp-2026"), s))
     assert out["identity"]["user_id"] == "demo"
+
+
+def test_hosted_without_access_code_refuses_to_start(monkeypatch):
+    monkeypatch.setenv("RENDER", "true")
+    s = Settings(jwt_secret="x" * 32, llm_provider="mock", standalone_access_code="")
+    with pytest.raises(SystemExit):
+        s.startup_checks()
+
+
+def test_require_access_code_flag_refuses_to_start(monkeypatch):
+    monkeypatch.delenv("RENDER", raising=False)
+    s = Settings(jwt_secret="x" * 32, llm_provider="mock", require_access_code=True)
+    with pytest.raises(SystemExit):
+        s.startup_checks()
+
+
+def test_hosted_with_access_code_starts(monkeypatch):
+    monkeypatch.setenv("RENDER", "true")
+    s = Settings(jwt_secret="x" * 32, llm_provider="mock", standalone_access_code="hisp-2026")
+    s.startup_checks()  # no SystemExit
+
+
+def test_hosted_login_rejects_empty_and_wrong_codes(monkeypatch):
+    monkeypatch.setenv("RENDER", "true")
+    s = Settings(jwt_secret="x" * 32, standalone_access_code="hisp-2026")
+    for pw in ("wrong", "HISP-2026", "hisp-2026 ", "demo"):
+        with pytest.raises(HTTPException) as exc:
+            _run(login(LoginRequest(username="demo", password=pw), s))
+        assert exc.value.status_code == 401
+
+
+def test_hosted_login_without_code_configured_is_disabled(monkeypatch):
+    monkeypatch.setenv("RENDER", "true")
+    s = Settings(jwt_secret="x" * 32, standalone_access_code="")
+    with pytest.raises(HTTPException) as exc:
+        _run(login(LoginRequest(username="demo", password="anything"), s))
+    assert exc.value.status_code == 503

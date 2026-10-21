@@ -1,0 +1,7 @@
+[
+  {"id": "anc1", "label": "ANC 1 Coverage · Sierra Leone · 12 months", "question": "Show me ANC 1 Coverage in Sierra Leone for the last 12 months", "output_mode": "dashboard"},
+  {"id": "penta3", "label": "Penta 3 coverage <1y by district · 2025", "question": "Show Penta 3 coverage <1y for each district in Sierra Leone for 2025", "output_mode": "dashboard"},
+  {"id": "idsr", "label": "IDSR Malaria trend · 12 months", "question": "Show me the trend of IDSR Malaria in Sierra Leone for the last 12 months", "output_mode": "dashboard"},
+  {"id": "report", "label": "Programme review report · ANC 1", "question": "Write a programme review report on ANC 1 Coverage in Sierra Leone for the last 12 months", "output_mode": "report"},
+  {"id": "export", "label": "Export ANC 1 by district to Excel", "question": "Export ANC 1 Coverage by district for the last 12 months to Excel", "output_mode": "export"}
+]
