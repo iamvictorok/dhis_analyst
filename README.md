@@ -2,6 +2,8 @@
 
 Conversational public health analytics for DHIS2. The implementation follows the consolidated spec in `dhis2-ai-analyst-spec.md` and ships all major surfaces at once: streaming chat, deterministic local agent fallback, DHIS2 Analytics API adapter, metadata search/sync contract, evidence tags, report/dashboard/presentation/export outputs, standalone auth, and a no-build static frontend.
 
+> **Presenting it?** See the step-by-step live demo script: [docs/DEMO.md](docs/DEMO.md).
+
 ## Run Backend
 
 ```powershell
