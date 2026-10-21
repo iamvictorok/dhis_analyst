@@ -92,6 +92,10 @@ def _data_facts(state: AgentState) -> str:
     if not rows:
         return ""
     order = _period_order(state)
+    # Totals only make sense for counts (data elements), not rates/percentages.
+    metric_types = {
+        str(m.get("label")): m.get("object_type") for m in state.get("metrics", []) if m.get("label")
+    }
     series: dict[tuple[str, str], list[tuple[str, float]]] = {}
     for r in rows:
         try:
@@ -112,8 +116,9 @@ def _data_facts(state: AgentState) -> str:
         else:
             line += (
                 f"; highest {_fmt(hi[1])} ({hi[0]}); lowest {_fmt(lo[1])} ({lo[0]}); "
-                f"mean {_fmt(sum(vals) / len(vals))}; sum {_fmt(sum(vals))}; "
-                f"first {_fmt(pts[0][1])} ({pts[0][0]}) -> last {_fmt(pts[-1][1])} ({pts[-1][0]})"
+                f"mean {_fmt(sum(vals) / len(vals))}; "
+                + (f"total {_fmt(sum(vals))}; " if metric_types.get(metric) == "dataElement" else "")
+                + f"first {_fmt(pts[0][1])} ({pts[0][0]}) -> last {_fmt(pts[-1][1])} ({pts[-1][0]})"
             )
             if pts[0][1]:
                 line += f" = {((pts[-1][1] - pts[0][1]) / pts[0][1]) * 100:+.1f}%"
@@ -134,7 +139,8 @@ def _data_facts(state: AgentState) -> str:
     )
     return (
         "PRE-COMPUTED FACTS (authoritative; quote these exactly, do not recompute or "
-        "invent other statistics):\n" + "\n".join(lines)
+        "invent other statistics, and do not mention these instructions; count months "
+        "above/below a value only from the data rows):\n" + "\n".join(lines)
         + (f"\nDHIS2 UIDs used: {uids}" if uids else "")
     )
 
