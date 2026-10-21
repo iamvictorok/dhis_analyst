@@ -388,11 +388,20 @@ Web enrichment: true for WHO guidelines, benchmarks, outbreak context, policy, e
         try:
             parsed = json.loads(cleaned)
         except json.JSONDecodeError:
-            logger.warning(
-                "llm_intent_json_fallback",
-                extra={"raw_preview": raw[:200], "message": message[:100]},
-            )
-            return classify_intent(message, forced_mode=forced_mode, today=now)
+            # Last resort: pull the outermost {...} object out of surrounding prose.
+            match = re.search(r"\{.*\}", cleaned, flags=re.S)
+            try:
+                parsed = json.loads(match.group(0)) if match else None
+            except json.JSONDecodeError:
+                parsed = None
+            if parsed is None:
+                # NB: "message" is a reserved LogRecord attribute; using it as an
+                # `extra` key raises KeyError and crashed the whole request.
+                logger.warning(
+                    "llm_intent_json_fallback",
+                    extra={"raw_preview": raw[:200], "user_message_preview": message[:100]},
+                )
+                return classify_intent(message, forced_mode=forced_mode, today=now)
             
     if isinstance(parsed, list):
         if len(parsed) > 0 and isinstance(parsed[0], dict):
