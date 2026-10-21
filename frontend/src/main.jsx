@@ -83,6 +83,70 @@ async function apiPatch(path, body) {
 }
 
 // ---------------------------------------------------------------------------
+// Suggested demo questions (chips). The backend list (/api/demo/questions) wins;
+// this copy only covers an older backend. Chips SEND the question through the
+// normal pipeline — nothing is pre-answered.
+// ---------------------------------------------------------------------------
+
+const DEFAULT_DEMO_QUESTIONS = [
+  { id: 'anc1', label: 'ANC 1 Coverage · Sierra Leone · 12 months', question: 'Show me ANC 1 Coverage in Sierra Leone for the last 12 months', output_mode: 'dashboard' },
+  { id: 'penta3', label: 'Penta 3 coverage <1y by district · 2025', question: 'Show Penta 3 coverage <1y for each district in Sierra Leone for 2025', output_mode: 'dashboard' },
+  { id: 'idsr', label: 'IDSR Malaria trend · 12 months', question: 'Show me the trend of IDSR Malaria in Sierra Leone for the last 12 months', output_mode: 'dashboard' },
+  { id: 'report', label: 'Programme review report · ANC 1', question: 'Write a programme review report on ANC 1 Coverage in Sierra Leone for the last 12 months', output_mode: 'report' },
+  { id: 'export', label: 'Export ANC 1 by district to Excel', question: 'Export ANC 1 Coverage by district for the last 12 months to Excel', output_mode: 'export' },
+];
+
+const STATUS_TEXT = { live: 'Live', fallback: 'Fallback', cached: 'Cached', down: 'Offline', unknown: 'Checking' };
+
+function useDhis2Status(enabled) {
+  const [status, setStatus] = useState(null);
+  useEffect(() => {
+    if (!enabled) return undefined;
+    let stopped = false;
+    const load = () => fetch('/api/dhis2/status')
+      .then(r => (r.ok ? r.json() : null))
+      .then(d => { if (!stopped && d) setStatus(d); })
+      .catch(() => { if (!stopped) setStatus({ mode: 'unknown', label: 'Status unavailable' }); });
+    load();
+    const t = setInterval(load, 30000);
+    return () => { stopped = true; clearInterval(t); };
+  }, [enabled]);
+  return status;
+}
+
+function StatusDot({ status }) {
+  const mode = status?.mode || 'unknown';
+  const title = status?.label || 'Checking DHIS2…';
+  return (
+    <span class={`status-pill status-${mode}`} title={title} aria-label={`DHIS2 data source: ${title}`}>
+      <span class="status-dot" />
+      {STATUS_TEXT[mode] || mode}
+    </span>
+  );
+}
+
+function SuggestedChips({ questions, disabled, onPick }) {
+  if (!questions?.length) return null;
+  return (
+    <div class="suggest-chips" role="list" aria-label="Suggested questions">
+      {questions.map(q => (
+        <button
+          key={q.id}
+          type="button"
+          role="listitem"
+          class="suggest-chip"
+          disabled={disabled}
+          title={q.question}
+          onClick={() => onPick(q)}
+        >
+          {q.label || q.question}
+        </button>
+      ))}
+    </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
 // App
 // ---------------------------------------------------------------------------
 
@@ -99,9 +163,11 @@ function App() {
   const [loading, setLoading] = useState(false);
   const [mode, setMode] = useState('');
   const [clarification, setClarification] = useState(null);
+  const [demoQuestions, setDemoQuestions] = useState(DEFAULT_DEMO_QUESTIONS);
+  const dhis2Status = useDhis2Status(authed);
 
   // Artefacts accumulated during current stream (for the active assistant msg)
-  const streamArtefacts = useRef({ charts: [], reportHtml: '', slides: [], evidence: [], exportData: null });
+  const streamArtefacts = useRef({ charts: [], reportHtml: '', slides: [], evidence: [], exportData: null, dataSource: null });
 
   // Sidebar state
   const [sidebarOpen, setSidebarOpen] = useState(false);
@@ -122,6 +188,9 @@ function App() {
       apiGet('/api/conversations')
         .then(setConversations)
         .catch(() => setConversations([]));
+      apiGet('/api/demo/questions')
+        .then(qs => { if (Array.isArray(qs) && qs.length) setDemoQuestions(qs); })
+        .catch(() => {});
     }
   }, [authed]);
 
@@ -157,7 +226,7 @@ function App() {
       setActiveConvId(conv.id);
       setMessages([]);
       setClarification(null);
-      streamArtefacts.current = { charts: [], reportHtml: '', slides: [], evidence: [], exportData: null };
+      streamArtefacts.current = { charts: [], reportHtml: '', slides: [], evidence: [], exportData: null, dataSource: null };
       setSidebarOpen(false);
     } catch (err) {
       console.error('Failed to create conversation:', err);
@@ -172,7 +241,7 @@ function App() {
     abortRef.current?.abort();
     setActiveConvId(id);
     setClarification(null);
-    streamArtefacts.current = { charts: [], reportHtml: '', slides: [], evidence: [], exportData: null };
+    streamArtefacts.current = { charts: [], reportHtml: '', slides: [], evidence: [], exportData: null, dataSource: null };
     setSidebarOpen(false);
     try {
       const msgs = await apiGet(`/api/conversations/${id}/messages`);
@@ -202,8 +271,9 @@ function App() {
   // Send message
   // ---------------------------------------------------------------------------
 
-  const handleSend = useCallback(async (text) => {
+  const handleSend = useCallback(async (text, modeOverride) => {
     if (!text.trim() || loading) return;
+    const outputMode = modeOverride !== undefined ? modeOverride : mode;
     setClarification(null);
     setLoading(true);
 
@@ -213,7 +283,7 @@ function App() {
     abortRef.current = controller;
 
     // Reset stream artefacts
-    streamArtefacts.current = { charts: [], reportHtml: '', slides: [], evidence: [], exportData: null };
+    streamArtefacts.current = { charts: [], reportHtml: '', slides: [], evidence: [], exportData: null, dataSource: null };
 
     // Ensure we have an active conversation
     let convId = activeConvId;
@@ -261,7 +331,7 @@ function App() {
         body: JSON.stringify({
           message: text,
           conversation_id: convId,
-          output_mode: mode || null,
+          output_mode: outputMode || null,
           allow_web: true,
         }),
       });
@@ -333,6 +403,20 @@ function App() {
             break;
           case 'evidence':
             streamArtefacts.current.evidence = Array.isArray(data) ? data : [];
+            setMessages(prev => {
+              const updated = [...prev];
+              const last = updated[updated.length - 1];
+              if (last?.role === 'assistant') {
+                updated[updated.length - 1] = {
+                  ...last,
+                  artefacts: { ...streamArtefacts.current },
+                };
+              }
+              return updated;
+            });
+            break;
+          case 'data_source':
+            streamArtefacts.current.dataSource = data || null;
             setMessages(prev => {
               const updated = [...prev];
               const last = updated[updated.length - 1];
@@ -486,6 +570,7 @@ function App() {
             </h1>
           </div>
           <div class="main-header-right">
+            <StatusDot status={dhis2Status} />
             <button class="btn-sm" onClick={handleLogout}>Logout</button>
           </div>
         </header>
@@ -498,15 +583,16 @@ function App() {
                 <p class="thread-welcome-sub">
                   Ask a public health question about your DHIS2 data — trends, comparisons, dashboards, reports, and more.
                 </p>
+                <p class="thread-welcome-sub">Try one of these:</p>
+                <SuggestedChips questions={demoQuestions} disabled={loading} onPick={q => handleSend(q.question, q.output_mode || '')} />
               </div>
             )}
 
             {messages.length === 0 && activeConvId && (
               <div class="thread-welcome">
                 <p class="thread-welcome-title">💡 Ask a public health question</p>
-                <p class="thread-welcome-sub">
-                  Try: "Show me malaria trends in Kaduna over the last quarter"
-                </p>
+                <p class="thread-welcome-sub">Try one of these:</p>
+                <SuggestedChips questions={demoQuestions} disabled={loading} onPick={q => handleSend(q.question, q.output_mode || '')} />
               </div>
             )}
 
@@ -526,6 +612,12 @@ function App() {
             <div style="max-width:var(--thread-max);width:100%">
               <ClarificationPrompt question={clarification} />
             </div>
+          </div>
+        )}
+
+        {messages.length > 0 && (
+          <div class="suggest-chips-bar">
+            <SuggestedChips questions={demoQuestions} disabled={loading} onPick={q => handleSend(q.question, q.output_mode || '')} />
           </div>
         )}
 
@@ -558,6 +650,12 @@ function MessageBlock({ msg, isLast, isLoading }) {
     <div class={`message ${isUser ? 'message-user' : 'message-assistant'}`}>
       {!isUser && <span class="message-label">Assistant</span>}
       {isUser && <span class="message-label">You</span>}
+
+      {!isUser && art?.dataSource && art.dataSource.mode !== 'live' && (
+        <span class={`source-badge status-${art.dataSource.mode}`} title={art.dataSource.label}>
+          {art.dataSource.mode === 'cached' ? `⚠️ ${art.dataSource.label}` : `↪ ${art.dataSource.label}`}
+        </span>
+      )}
 
       <div class="message-bubble">
         {msg.content ? (
@@ -761,6 +859,7 @@ function Composer({ loading, mode, onModeChange, onSend }) {
           <option value="report">Report</option>
           <option value="presentation">Slides</option>
           <option value="export">Export</option>
+          <option value="map" disabled>Map (coming soon)</option>
         </select>
         <textarea
           ref={textareaRef}
