@@ -6,6 +6,7 @@ credentials (LLM_API_KEY or LLM_BASE_URL).
 """
 from __future__ import annotations
 
+import asyncio
 import logging
 import time
 from typing import Any
@@ -13,6 +14,30 @@ from typing import Any
 from backend.config import Settings
 
 logger = logging.getLogger("dhis2_analyst.llm")
+
+_TRANSIENT_MARKERS = (
+    "503", "unavailable", "high demand", "overloaded", "429", "resource_exhausted",
+    "rate limit", "ratelimit", "timeout", "timed out", "500", "internal error",
+    "502", "504", "apiconnectionerror", "serviceunavailable",
+)
+
+
+def _is_transient(exc: Exception) -> bool:
+    text = f"{type(exc).__name__} {exc}".lower()
+    return any(m in text for m in _TRANSIENT_MARKERS)
+
+
+def _fallback_models(settings: Settings, primary: str) -> list[str]:
+    raw = (settings.llm_fallback_models or "").strip()
+    if raw.lower() == "none":
+        return []
+    if raw:
+        models = [m.strip() for m in raw.split(",") if m.strip()]
+    elif "gemini" in settings.llm_provider.lower() or "gemini" in primary.lower():
+        models = ["gemini/gemini-flash-lite-latest"]
+    else:
+        models = []
+    return [m for m in models if m != primary]
 
 
 async def complete(
@@ -54,7 +79,7 @@ async def complete(
             "model": model,
             "messages": messages,
             "timeout": settings.llm_timeout_seconds,
-            "num_retries": 1,
+            "num_retries": 0,  # retries/fallbacks handled below
         }
 
         if "gemini" not in settings.llm_provider.lower() and "gemini" not in model.lower():
@@ -78,17 +103,40 @@ async def complete(
         )
 
         start = time.monotonic()
-        response = await litellm.acompletion(**kwargs)
-        content = response.choices[0].message.content or ""
-        logger.info(
-            "llm_call_ok",
-            extra={
-                "provider": settings.llm_provider,
-                "chars": len(content),
-                "duration_ms": int((time.monotonic() - start) * 1000),
-            },
-        )
-        return content
+        candidates = [model] + _fallback_models(settings, model)
+        retries = max(0, int(settings.llm_transient_retries))
+        last_exc: Exception | None = None
+        for idx, candidate in enumerate(candidates):
+            # Primary gets the full retry budget; each fallback gets one retry.
+            attempts = 1 + (retries if idx == 0 else min(retries, 1))
+            for attempt in range(attempts):
+                try:
+                    response = await litellm.acompletion(**{**kwargs, "model": candidate})
+                except Exception as exc:  # noqa: BLE001 - classified below
+                    last_exc = exc
+                    if not _is_transient(exc):
+                        raise
+                    logger.warning(
+                        "llm_call_transient",
+                        extra={"model": candidate, "attempt": attempt + 1, "error": str(exc)[:300]},
+                    )
+                    if attempt + 1 < attempts:
+                        await asyncio.sleep(settings.llm_retry_backoff_seconds * (2 ** attempt))
+                    continue
+                content = response.choices[0].message.content or ""
+                logger.info(
+                    "llm_call_ok",
+                    extra={
+                        "provider": settings.llm_provider,
+                        "model": candidate,
+                        "fallback": idx > 0,
+                        "chars": len(content),
+                        "duration_ms": int((time.monotonic() - start) * 1000),
+                    },
+                )
+                return content
+        assert last_exc is not None
+        raise last_exc
 
     except Exception as exc:
         logger.error(

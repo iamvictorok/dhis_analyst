@@ -48,6 +48,13 @@ class Settings(SettingsBase):
     llm_api_key: str = ""
     llm_base_url: str = ""              # for Ollama: http://localhost:11434
     llm_timeout_seconds: int = 30
+    # Transient-error resilience (503 "high demand", 429, timeouts): retry the
+    # primary model with backoff, then try each fallback model in order.
+    # Comma-separated LiteLLM model strings; empty = provider default (gemini:
+    # gemini/gemini-flash-lite-latest). Set to "none" to disable fallbacks.
+    llm_fallback_models: str = ""
+    llm_transient_retries: int = 2
+    llm_retry_backoff_seconds: float = 2.0
 
     # Embedding model
     embedding_provider: str = "mock"    # mock | openai | cohere | ollama
