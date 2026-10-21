@@ -43,6 +43,23 @@ _TRANSIENT_MARKERS = (
 
 _PRIMARY_DOWN_UNTIL: dict[str, float] = {}
 _BREAKER_SECONDS = 180.0
+_QUOTA_BREAKER_SECONDS = 900.0
+
+
+def _is_quota_exhausted(exc: Exception) -> bool:
+    text = f"{type(exc).__name__} {exc}".lower()
+    return ("429" in text or "ratelimit" in text or "resource_exhausted" in text or "quota" in text) and (
+        "per day" in text or "perday" in text or "quota" in text or "resource_exhausted" in text
+    )
+
+
+def _safe_error(exc: Exception) -> str:
+    """Short, key-free error summary for the client-side timings event."""
+    import re as _re
+    msg = f"{type(exc).__name__}: {exc}"
+    msg = _re.sub(r"(key=|api[_-]?key[\"':= ]+)[A-Za-z0-9_\-]{8,}", r"\1***", msg, flags=_re.I)
+    msg = _re.sub(r"AIza[0-9A-Za-z_\-]{20,}", "***", msg)
+    return msg[:220]
 
 
 def _is_transient(exc: Exception) -> bool:
@@ -141,6 +158,10 @@ async def complete(
         if breaker_open:
             candidates = fallbacks + [model]
         last_exc: Exception | None = None
+        live = [c for c in candidates if _PRIMARY_DOWN_UNTIL.get(c, 0.0) <= time.monotonic()]
+        if live and len(live) < len(candidates):
+            # Models marked down go last, with a single attempt.
+            candidates = live + [c for c in candidates if c not in live]
         for idx, candidate in enumerate(candidates):
             # Primary gets the full retry budget; each fallback gets one retry.
             is_primary = candidate == model
@@ -158,14 +179,20 @@ async def complete(
                         "llm_call_transient",
                         extra={"model": candidate, "attempt": attempt + 1, "error": str(exc)[:300]},
                     )
+                    _record_call({"model": candidate, "attempt": attempt + 1, "transient": True,
+                                  "error": _safe_error(exc), "seconds": round(time.monotonic() - start, 2)})
+                    if _is_quota_exhausted(exc):
+                        # Daily / quota exhaustion: retrying the same model only burns
+                        # more quota and time. Mark it down and move to the next model.
+                        _PRIMARY_DOWN_UNTIL[candidate] = time.monotonic() + _QUOTA_BREAKER_SECONDS
+                        break
                     if attempt + 1 < attempts:
                         await asyncio.sleep(settings.llm_retry_backoff_seconds * (2 ** attempt))
                     elif is_primary and fallbacks:
                         _PRIMARY_DOWN_UNTIL[model] = time.monotonic() + _BREAKER_SECONDS
                     continue
                 content = response.choices[0].message.content or ""
-                if is_primary:
-                    _PRIMARY_DOWN_UNTIL.pop(model, None)
+                _PRIMARY_DOWN_UNTIL.pop(candidate, None)
                 _record_call({"model": candidate, "fallback": not is_primary, "breaker": breaker_open, "attempt": attempt + 1,
                               "seconds": round(time.monotonic() - start, 2), "json": json_mode})
                 logger.info(

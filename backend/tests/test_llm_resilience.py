@@ -85,3 +85,19 @@ def test_breaker_closes_when_primary_recovers(monkeypatch):
     calls = _patch(monkeypatch, lambda m, n: "primary")
     assert asyncio.run(llm.complete([{"role": "user", "content": "x"}], _settings())) == "primary"
     assert calls == ["gemini/gemini-flash-latest"]
+
+
+def test_quota_exhausted_is_not_retried(monkeypatch):
+    def b(m, n):
+        if m == "gemini/gemini-flash-latest":
+            return RuntimeError("RateLimitError: 429 RESOURCE_EXHAUSTED quota exceeded per day")
+        return "lite"
+    calls = _patch(monkeypatch, b)
+    assert asyncio.run(llm.complete([{"role": "user", "content": "x"}], _settings())) == "lite"
+    assert calls == ["gemini/gemini-flash-latest", "gemini/gemini-flash-lite-latest"]
+
+
+def test_safe_error_strips_keys():
+    e = RuntimeError("bad request key=AIzaSyA1234567890abcdefghijklmnop api_key: sk-abcdef123456")
+    out = llm._safe_error(e)
+    assert "AIzaSy" not in out and "sk-abcdef123456" not in out

@@ -2,4 +2,4 @@
 
 Render also exposes RENDER_GIT_COMMIT at runtime; /health reports both.
 """
-BUILD_ID = "hardening-2026-10-21.5"
+BUILD_ID = "hardening-2026-10-21.6"
