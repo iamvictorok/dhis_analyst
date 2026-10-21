@@ -191,6 +191,15 @@ async def lifespan(app: FastAPI):
                 extra={"error": str(exc)},
             )
 
+    # --- First line of defense: prime metadata index at startup ---
+    if settings.dhis2_service_account_user:
+        try:
+            logger.info("startup_metadata_sync_initiating")
+            sync_res = await sync_metadata(settings)
+            logger.info("startup_metadata_sync_completed", extra={"status": sync_res.get("status"), "synced": sync_res.get("synced")})
+        except Exception as exc:
+            logger.warning("startup_metadata_sync_error", extra={"error": str(exc)})
+
     sync_task = asyncio.create_task(_metadata_sync_loop())
     cleanup_task = asyncio.create_task(_temp_file_cleanup_loop())
 

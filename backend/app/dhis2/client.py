@@ -118,6 +118,10 @@ class DHIS2Client:
             )
         return results
 
+    async def get(self, path: str, params: dict[str, Any] | None = None) -> dict[str, Any]:
+        """Generic GET method for DHIS2 API endpoints."""
+        return await self._get(path, params=params)
+
     async def me(self) -> dict[str, Any]:
         """Fetch current user profile — used for token validation."""
         return await self._get("/api/me.json")

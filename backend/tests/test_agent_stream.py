@@ -39,7 +39,7 @@ def mock_llm_complete():
                 return f"""{{
                     "output_mode": "{output_mode}",
                     "requires_data": true,
-                    "metrics": [{{"label": "Malaria Confirmed Cases", "uid": null, "object_type": "indicator"}}],
+                    "metrics": [{{"label": "Malaria Confirmed Cases", "uid": "s46m5MS0hxu", "uid_confidence": 0.95, "object_type": "indicator"}}],
                     "org_unit_label": "Kaduna",
                     "periods": ["2024"],
                     "needs_web_enrichment": false,

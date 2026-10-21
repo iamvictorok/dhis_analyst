@@ -86,6 +86,21 @@ async def resolve_metadata(state: AgentState, settings: Settings) -> AgentState:
         except Exception as exc:
             logger.warning("llm_rerank_failed", extra={"error": str(exc)})
 
+    # 3b. Live DHIS2 REST API Fallback — when local DB missed or left UID unresolved
+    unresolved_metrics = [
+        m for m in metrics
+        if not m.get("uid") or m.get("uid") == "UNRESOLVED" or m.get("uid_confidence", 0) < threshold
+    ]
+    if unresolved_metrics:
+        try:
+            metrics = await _resolve_indicators_via_live_dhis2_api(
+                metrics, settings, state, threshold,
+            )
+            state["metrics"] = metrics
+            low_confidence = [m for m in metrics if m["uid_confidence"] < threshold]
+        except Exception as exc:
+            logger.warning("live_dhis2_api_indicator_resolve_failed", extra={"error": str(exc)})
+
     # 4. Auto-resolve: if still low confidence, take the best available match
     #    instead of blocking the pipeline. The user asked in natural language —
     #    they shouldn't need to know DHIS2 indicator names.
@@ -128,7 +143,9 @@ async def resolve_metadata(state: AgentState, settings: Settings) -> AgentState:
 
     if needs_resolution and org_label.lower() not in {"national", "federal"}:
         try:
-            resolved = await _resolve_org_unit_from_db(org_label, settings)
+            resolved = await _resolve_org_unit_from_db_or_live_api(
+                org_label, settings, token=state.get("_dhis2_token")
+            )
             if resolved:
                 state["org_unit"] = resolved
                 logger.info(
@@ -219,6 +236,144 @@ async def _uid_exists(session, uid: str, settings: Settings) -> bool:
         # If we can't check, don't trust the UID — fall through to resolution.
         logger.warning("uid_existence_check_failed", extra={"uid": uid, "error": str(exc)})
         return False
+
+
+async def _resolve_indicators_via_live_dhis2_api(
+    metrics: list[dict],
+    settings: Settings,
+    state: AgentState,
+    threshold: float,
+) -> list[dict]:
+    """Fallback: query live DHIS2 API directly when local metadata_index misses.
+
+    Prevents the agent from failing with INDICATORS_NOT_FOUND whenever local
+    metadata_index is unseeded or incomplete.
+    """
+    token = state.get("_dhis2_token")
+    if not settings.dhis2_service_account_user and not token:
+        return metrics
+
+    try:
+        from backend.app.dhis2.client import DHIS2Client
+        client = DHIS2Client(settings, token=token)
+    except Exception as exc:
+        logger.warning("dhis2_client_init_failed_in_live_resolver", extra={"error": str(exc)})
+        return metrics
+
+    search_alts = state.get("metric_search_terms") or []
+
+    resolved = []
+    for metric in metrics:
+        if metric.get("uid") and metric["uid"] != "UNRESOLVED" and metric.get("uid_confidence", 0) >= threshold:
+            resolved.append(metric)
+            continue
+
+        search_candidates = [metric["label"]] + list(metric.get("search_terms") or []) + list(search_alts)
+        found_match = None
+
+        for query in search_candidates:
+            if not query or not str(query).strip():
+                continue
+            query_str = str(query).strip()
+
+            # Try /api/indicators
+            try:
+                raw_ind = await client.get(
+                    "/api/indicators.json",
+                    params={"filter": f"name:ilike:{query_str}", "fields": "id,name", "pageSize": "5"},
+                )
+                items = raw_ind.get("indicators", [])
+                if items:
+                    found_match = {
+                        "label": items[0]["name"],
+                        "uid": items[0]["id"],
+                        "uid_confidence": 0.88,
+                        "object_type": "indicator",
+                    }
+                    break
+            except Exception as exc:
+                logger.debug("live_dhis2_indicator_search_failed", extra={"query": query_str, "error": str(exc)})
+
+            # Try /api/dataElements
+            try:
+                raw_de = await client.get(
+                    "/api/dataElements.json",
+                    params={"filter": f"name:ilike:{query_str}", "fields": "id,name", "pageSize": "5"},
+                )
+                items = raw_de.get("dataElements", [])
+                if items:
+                    found_match = {
+                        "label": items[0]["name"],
+                        "uid": items[0]["id"],
+                        "uid_confidence": 0.88,
+                        "object_type": "dataElement",
+                    }
+                    break
+            except Exception as exc:
+                logger.debug("live_dhis2_dataelement_search_failed", extra={"query": query_str, "error": str(exc)})
+
+            # Try /api/programIndicators
+            try:
+                raw_pi = await client.get(
+                    "/api/programIndicators.json",
+                    params={"filter": f"name:ilike:{query_str}", "fields": "id,name", "pageSize": "5"},
+                )
+                items = raw_pi.get("programIndicators", [])
+                if items:
+                    found_match = {
+                        "label": items[0]["name"],
+                        "uid": items[0]["id"],
+                        "uid_confidence": 0.88,
+                        "object_type": "programIndicator",
+                    }
+                    break
+            except Exception as exc:
+                logger.debug("live_dhis2_progindicator_search_failed", extra={"query": query_str, "error": str(exc)})
+
+        if found_match:
+            logger.info("live_dhis2_metadata_resolved", extra={"query": metric["label"], "resolved": found_match})
+            resolved.append(found_match)
+        else:
+            resolved.append(metric)
+
+    return resolved
+
+
+async def _resolve_org_unit_from_db_or_live_api(
+    label: str,
+    settings: Settings,
+    token: str | None = None,
+) -> dict | None:
+    # 1. Try local DB first
+    try:
+        resolved = await _resolve_org_unit_from_db(label, settings)
+        if resolved:
+            return resolved
+    except Exception as exc:
+        logger.warning("local_org_unit_db_search_failed", extra={"label": label, "error": str(exc)})
+
+    # 2. Try live DHIS2 API
+    if settings.dhis2_service_account_user or token:
+        try:
+            from backend.app.dhis2.client import DHIS2Client
+            client = DHIS2Client(settings, token=token)
+            raw = await client.get(
+                "/api/organisationUnits.json",
+                params={"filter": f"name:ilike:{label.strip()}", "fields": "id,name,level", "pageSize": "3"},
+            )
+            units = raw.get("organisationUnits", [])
+            if units:
+                best = units[0]
+                logger.info("live_dhis2_org_unit_resolved", extra={"label": label, "resolved_uid": best["id"], "resolved_name": best["name"]})
+                return {
+                    "label": best["name"],
+                    "uid": best["id"],
+                    "level": best.get("level", 2),
+                }
+        except Exception as exc:
+            logger.warning("live_dhis2_org_unit_search_failed", extra={"label": label, "error": str(exc)})
+
+    return None
 
 
 async def _resolve_org_unit_from_db(label: str, settings: Settings) -> dict | None:

@@ -769,10 +769,18 @@ def _normalise_llm_metrics(raw: Any) -> list[dict[str, Any]]:
             search_terms = []
         search_terms = [str(t).strip() for t in search_terms if t and str(t).strip()]
 
+        raw_uid = m.get("uid")
+        if isinstance(raw_uid, str) and re.match(r"^[A-Za-z][A-Za-z0-9]{10}$", raw_uid):
+            uid = raw_uid
+            confidence = float(m.get("uid_confidence") or 0.50)
+        else:
+            uid = "UNRESOLVED"
+            confidence = 0.40
+
         metric: dict[str, Any] = {
             "label": label.strip(),
-            "uid": "UNRESOLVED",
-            "uid_confidence": 0.40,
+            "uid": uid,
+            "uid_confidence": confidence,
             "object_type": m.get("object_type") if isinstance(m.get("object_type"), str) else "indicator",
         }
         if search_terms:

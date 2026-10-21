@@ -9,6 +9,14 @@ export default defineConfig({
     outDir: 'dist',
     emptyOutDir: true,
     sourcemap: false,
+    rollupOptions: {
+      output: {
+        manualChunks: {
+          plotly: ['plotly.js-dist-min'],
+          tiptap: ['@tiptap/core', '@tiptap/starter-kit', '@tiptap/extension-table'],
+        },
+      },
+    },
   },
   server: {
     port: 5173,
