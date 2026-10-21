@@ -69,18 +69,12 @@ def html_to_docx(html: str, title: str = "DHIS2 Analyst Report") -> bytes:
                 run.font.name = "Arial"
 
         elif node.name == "p":
-            text = _text(node)
-            if text:
-                para = doc.add_paragraph(text)
-                para.style.font.name = "Arial"
+            _add_formatted_paragraph(doc, node)
 
         elif node.name in {"ul", "ol"}:
             for li in node.find_all("li", recursive=False):
-                text = _text(li)
-                if text:
-                    style_name = "List Bullet" if node.name == "ul" else "List Number"
-                    para = doc.add_paragraph(text, style=style_name)
-                    para.style.font.name = "Arial"
+                style_name = "List Bullet" if node.name == "ul" else "List Number"
+                _add_formatted_paragraph(doc, li, style_name=style_name)
 
         elif node.name == "table":
             _add_table(doc, node)
@@ -90,6 +84,50 @@ def html_to_docx(html: str, title: str = "DHIS2 Analyst Report") -> bytes:
     data = out.getvalue()
     logger.info("docx_generate_ok", extra={"size_bytes": len(data), "node_count": node_count})
     return data
+
+
+def _add_formatted_paragraph(doc: Document, node, style_name: str | None = None):
+    para = doc.add_paragraph(style=style_name) if style_name else doc.add_paragraph()
+    para.style.font.name = "Arial"
+
+    contents = list(node.contents) if hasattr(node, "contents") else []
+    if not contents:
+        text = _text(node)
+        if text:
+            run = para.add_run(text)
+            run.font.name = "Arial"
+        return para
+
+    for child in contents:
+        if isinstance(child, str):
+            text = child.strip()
+            if text:
+                run = para.add_run(text + " ")
+                run.font.name = "Arial"
+        elif getattr(child, "name", None) in {"b", "strong"}:
+            text = _text(child)
+            if text:
+                run = para.add_run(text + " ")
+                run.bold = True
+                run.font.name = "Arial"
+        elif getattr(child, "name", None) in {"i", "em"}:
+            text = _text(child)
+            if text:
+                run = para.add_run(text + " ")
+                run.italic = True
+                run.font.name = "Arial"
+        elif getattr(child, "name", None) == "code":
+            text = _text(child)
+            if text:
+                run = para.add_run(text + " ")
+                run.font.name = "Courier New"
+        else:
+            text = _text(child)
+            if text:
+                run = para.add_run(text + " ")
+                run.font.name = "Arial"
+
+    return para
 
 
 def _add_table(doc: Document, table_node) -> None:
