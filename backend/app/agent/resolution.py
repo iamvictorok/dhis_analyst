@@ -157,6 +157,9 @@ async def load_catalogue(settings: Settings) -> dict[str, Any]:
         toks = set(tokens(name)) | set(tokens(short or ""))
         if not toks:
             continue
+        # Compound spellings: "breast feeding" also matches "breastfeeding".
+        nt = tokens(name)
+        toks |= {a + b for a, b in zip(nt, nt[1:]) if a.isalpha() and b.isalpha()}
         items.append({"uid": uid, "label": name, "object_type": otype,
                       "description": (desc or "")[:200], "tokens": toks,
                       "source": " ".join(str(dsn or "").split())[:80],
@@ -446,6 +449,13 @@ _TRACKER_WORDS = re.compile(
     r"\b(program(?:me)?s?|tracker|case[- ]based|event(?:s)?|individual|line[- ]?list|register(?:ed)?|enrol(?:l)?ments?|registry)\b",
     re.I,
 )
+
+
+_RATE_WORDS = re.compile(r"\b(coverage|rates?|percent(?:age)?|%|proportion|ratio|dropout|drop-out|completeness)\b", re.I)
+
+
+def asks_for_rate(text: str) -> bool:
+    return bool(_RATE_WORDS.search(text or ""))
 
 
 def mentions_tracker(text: str) -> bool:

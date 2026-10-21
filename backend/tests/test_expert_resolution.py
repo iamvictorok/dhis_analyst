@@ -268,3 +268,27 @@ def test_numden_captured_and_shown():
     assert st["dhis2_data"]["rows"] == [["Sierra Leone", "2025", "103.82", "ANC 1 Coverage"]]
     line = _data_used_text(st)
     assert "253,269" in line and "243,951" in line and "Estimated number of pregnant women" in line
+
+
+def test_multi_metric_exact_names_are_trusted(monkeypatch, tmp_path):
+    """'Compare ANC 1st visit and ANC 4th or more visits' must keep both items."""
+    from backend.app.agent.nodes import metadata_resolve as M
+    from backend.config import Settings
+
+    async def fake_cat(settings):
+        return CAT
+
+    monkeypatch.setattr(R, "load_catalogue", fake_cat)
+    state = {
+        "messages": [{"role": "user", "content": "Compare ANC 1 Coverage and ANC => 4 Coverage in Kenema"}],
+        "metrics": [
+            {"label": "ANC 1 Coverage", "uid": "Uvn6LCg7dVU", "uid_confidence": 0.97, "object_type": "indicator"},
+            {"label": "ANC => 4 Coverage", "uid": "AUqdhY4mpvp", "uid_confidence": 0.97, "object_type": "indicator"},
+        ],
+        "org_unit": {"label": "Kenema", "uid": "kJq2mPyFEHo", "level": 2},
+        "periods": ["THIS_YEAR"], "disaggregations": [],
+    }
+    s = Settings(llm_provider="mock", database_url=f"sqlite+aiosqlite:///{tmp_path}/t.db")
+    out = asyncio.run(M._expert_resolve(state, s))
+    assert out["status"] == "ok"
+    assert [m["uid"] for m in state["metrics"]] == ["Uvn6LCg7dVU", "AUqdhY4mpvp"]

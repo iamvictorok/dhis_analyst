@@ -1050,7 +1050,9 @@ async def _expert_resolve(state: AgentState, settings: Settings) -> dict:
     def exact_is_best(m: dict) -> bool:
         """A typed exact name is trusted only if no other item fits the user's words better
         ("BCG doses were given" should not lock onto "BCG doses" over "BCG doses given")."""
-        if not q_user:
+        if not q_user or len(metrics) > 1:
+            # Several names typed verbatim ("Compare ANC 1st visit and ANC 4th or
+            # more visits"): each one is what the user named; trust them.
             return True
         by_uid = {it["uid"]: it for it in cat["items"]}
         it = by_uid.get(m.get("uid"))
@@ -1082,7 +1084,7 @@ async def _expert_resolve(state: AgentState, settings: Settings) -> dict:
         m = metrics[i]
         label = str(m.get("label") or "")
         q_label = R.content_tokens(label, org_stop)
-        queries = [(q_user, 1.0), (q_label, 0.95)]
+        queries = [(q_user, 1.0), (q_label, 0.95)] if len(metrics) == 1 else [(q_label, 1.0), (q_user, 0.6)]
         for t in (m.get("search_terms") or [])[:4]:
             queries.append((R.content_tokens(str(t), org_stop), 0.85))
         pool = R.rank_candidates(queries, cat, limit=40)
@@ -1113,12 +1115,31 @@ async def _expert_resolve(state: AgentState, settings: Settings) -> dict:
             return {"decision": "ambiguous", "choice": 0, "alternatives": [], "options": [],
                     "candidates": opts or shown, "label": label, "by": "vague",
                     "requested_concept": " ".join(user_text.split()[:6]) if not q_user else " ".join(q_user)}
-        if use_llm and shown:
+        if use_llm and shown and len(metrics) == 1:
+            # Fast path: the user's own words point clearly at one item that has
+            # data (no unknown words, clear margin) -> no judge call needed.
+            ranked_u = sorted(shown, key=lambda c: -c["user_score"])
+            top_c = ranked_u[0]
+            second = ranked_u[1]["user_score"] if len(ranked_u) > 1 else 0.0
+            if (top_c["user_score"] >= 0.8 and top_c["user_score"] - second >= 0.12 and top_c.get("has_data")
+                    and not unknown and (top_c["object_type"] != "programIndicator" or R.mentions_tracker(user_text))
+                    and (top_c["object_type"] == "indicator" or not R.asks_for_rate(user_text))):
+                verdict = {"decision": "match", "choice": shown.index(top_c) + 1,
+                           "alternatives": [shown.index(c) + 1 for c in ranked_u[1:4]
+                                            if c["user_score"] >= top_c["user_score"] - 0.2],
+                           "options": [], "by": "clear-match"}
+        if verdict is None and use_llm and shown:
             await R.annotate_program_names(client, shown)
-            verdict = await R.llm_judge(user_text, label, shown, _place_text(state), _period_text(state),
+            question = user_text
+            if len(metrics) > 1:
+                others = [str(x.get("label")) for j, x in enumerate(metrics) if j != i]
+                question = (f"{user_text}\n(This question names several items. Decide ONLY for the item "
+                            f"\"{label}\"; the other item(s) {others} are resolved separately.)")
+            verdict = await R.llm_judge(question, label, shown, _place_text(state), _period_text(state),
                                         context, settings)
         if verdict is None:
-            rescored = [{**c, "score": c["user_score"] if q_user else c["score"]} for c in shown]
+            use_user = q_user and len(metrics) == 1
+            rescored = [{**c, "score": c["user_score"] if use_user else c["score"]} for c in shown]
             verdict = R.deterministic_judge(q_user, rescored, unknown)
         verdict["candidates"] = shown
         verdict["label"] = label
@@ -1134,6 +1155,25 @@ async def _expert_resolve(state: AgentState, settings: Settings) -> dict:
         return {"status": "clarify", "question": _ambiguous_question(ambiguous[0])}
     if missing and len(missing) == len(metrics):
         return {"status": "not_available", "message": _not_available_message(missing, state)}
+
+    # Two different requested items must not collapse onto one data item.
+    used: dict[str, int] = {}
+    for i, v in zip(todo, verdicts):
+        if v["decision"] != "match":
+            continue
+        uid = v["candidates"][v["choice"] - 1]["uid"]
+        fixed = {metrics[j].get("uid") for j in range(len(metrics)) if j not in todo}
+        if uid in used or uid in fixed:
+            label_q = R.content_tokens(v["label"])
+            alt = sorted(
+                (k for k, c in enumerate(v["candidates"], 1) if c["uid"] not in used and c["uid"] not in fixed),
+                key=lambda k: -R.score_item(label_q, {"tokens": set(R.tokens(v["candidates"][k - 1]["label"])),
+                                                       "name_tokens": R.tokens(v["candidates"][k - 1]["label"])}, cat),
+            )
+            if alt:
+                v["choice"] = alt[0]
+                uid = v["candidates"][alt[0] - 1]["uid"]
+        used[uid] = i
 
     notes: list[str] = []
     new_metrics = list(metrics)
