@@ -59,3 +59,4 @@ class AgentState(TypedDict):
     not_available_message: Optional[str]
     resolution_notes: list[str]
     category_labels: dict[str, str]
+    include_numden: bool

@@ -248,3 +248,23 @@ def test_prefer_aggregate_uses_judges_aggregate_alternative():
     v3 = {"decision": "match", "choice": 1, "alternatives": [], "candidates": cands, "by": "llm"}
     _prefer_aggregate(v3, "Malaria confirmed cases", [], CAT, R)
     assert v3["choice"] == 1
+
+
+def test_numden_captured_and_shown():
+    from backend.app.dhis2.analytics import normalise_analytics_response, build_analytics_params
+    from backend.app.agent.graph import _data_used_text
+    st = {"metrics": [{"label": "ANC 1 Coverage", "uid": "Uvn6LCg7dVU", "object_type": "indicator",
+                       "formula": {"numerator": "Total ANC 1 visits", "denominator": "Estimated number of pregnant women",
+                                   "type": "Per cent", "factor": 100}}],
+          "org_unit": {"label": "Sierra Leone", "uid": "ImspTQPwCqd", "level": 1}, "periods": ["2025"],
+          "disaggregations": [], "include_numden": True}
+    params = build_analytics_params(st)
+    assert params["includeNumDen"] == "true"
+    raw = {"headers": [{"name": "dx"}, {"name": "ou"}, {"name": "pe"}, {"name": "value", "meta": False},
+                       {"name": "numerator", "meta": False}, {"name": "denominator", "meta": False},
+                       {"name": "factor", "meta": False}],
+           "rows": [["ANC 1 Coverage", "Sierra Leone", "2025", "103.82", "253269.0", "243951.0", "100.0"]], "metaData": {}}
+    st["dhis2_data"] = normalise_analytics_response(raw, params)
+    assert st["dhis2_data"]["rows"] == [["Sierra Leone", "2025", "103.82", "ANC 1 Coverage"]]
+    line = _data_used_text(st)
+    assert "253,269" in line and "243,951" in line and "Estimated number of pregnant women" in line

@@ -70,6 +70,9 @@ def build_analytics_params(state: AgentState) -> dict[str, Any]:
         "outputIdScheme": "NAME",
         "skipMeta": "false",
     }
+    if state.get("include_numden"):
+        # Expert asked for numerator / denominator: DHIS2 returns them per row.
+        params["includeNumDen"] = "true"
     # Append valid category UIDs as dimensions. Free-text
     # tokens that failed to resolve in metadata_resolve are dropped to avoid 409s.
     category_uids = [d for d in disaggregations if DHIS2_UID_RE.match(d)]
@@ -152,6 +155,9 @@ def normalise_analytics_response(raw: dict[str, Any], params: dict[str, Any]) ->
     def header_id(h: dict) -> str:
         return str(h.get("name") or h.get("column") or "").lower()
 
+    col_any: dict[str, int] = {}
+    for i, h in enumerate(raw_headers):
+        col_any.setdefault(header_id(h), i)
     col: dict[str, int] = {}
     for i, h in enumerate(raw_headers):
         hid = header_id(h)
@@ -196,6 +202,14 @@ def normalise_analytics_response(raw: dict[str, Any], params: dict[str, Any]) ->
                 "analytics_params": params,
             },
         }
+        ni, di = col_any.get("numerator"), col_any.get("denominator")
+        if ni is not None and di is not None:
+            normalised["metadata"]["numden"] = [
+                {"org": cell(r, oi), "period": cell(r, pi), "metric": metric_cell(r), "value": cell(r, vi),
+                 "numerator": cell(r, ni), "denominator": cell(r, di),
+                 "factor": cell(r, col_any.get("factor"))}
+                for r in rows
+            ]
         logger.info(
             "normalise_analytics_response_complete",
             extra={"rows_count": len(canonical_rows), "reordered": True},

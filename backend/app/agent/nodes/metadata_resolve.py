@@ -267,6 +267,18 @@ async def resolve_metadata(state: AgentState, settings: Settings) -> AgentState:
                     m["uid_confidence"] = threshold  # promote to pass the gate
             state["metrics"] = metrics
 
+    # --- Numerator / denominator / formula questions on indicators ---
+    if re.search(r"\b(numerators?|denominators?|formula|how\s+is\s+.+\s+calculated|calculation)\b",
+                 _last_user_text(state), re.I):
+        inds = [m for m in state.get("metrics") or [] if m.get("object_type") == "indicator"
+                and _looks_like_dhis2_uid(m.get("uid") or "")]
+        if inds:
+            state["include_numden"] = True
+            try:
+                await _indicator_formulas(inds, state, settings)
+            except Exception as exc:
+                logger.warning("indicator_formula_lookup_failed", extra={"error": str(exc)})
+
     # --- Disaggregation resolution ---
     # Category breakdowns ("by age", "by sex") are only meaningful for data
     # elements whose category combo contains that category, so match the
@@ -1312,3 +1324,20 @@ def _prefer_aggregate(verdict: dict, user_text: str, q_user: list[str], cat: dic
             verdict["alternatives"] = [old_choice] + [k for k in verdict["alternatives"] if k not in (j, old_choice)]
             verdict["by"] = f"{verdict.get('by')}+aggregate"
             return
+
+
+async def _indicator_formulas(inds: list[dict], state: AgentState, settings: Settings) -> None:
+    """Attach numerator/denominator descriptions and the indicator type to each indicator."""
+    if not (settings.dhis2_service_account_user or state.get("_dhis2_token")):
+        return
+    from backend.app.dhis2.client import DHIS2Client
+    client = DHIS2Client(settings, token=state.get("_dhis2_token"))
+    for m in inds:
+        raw = await client.get(f"/api/indicators/{m['uid']}.json", params={
+            "fields": "numeratorDescription,denominatorDescription,indicatorType[name,factor]"})
+        m["formula"] = {
+            "numerator": raw.get("numeratorDescription") or "",
+            "denominator": raw.get("denominatorDescription") or "",
+            "type": (raw.get("indicatorType") or {}).get("name") or "",
+            "factor": (raw.get("indicatorType") or {}).get("factor"),
+        }

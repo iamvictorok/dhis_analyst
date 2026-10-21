@@ -645,6 +645,21 @@ def _data_used_text(state: AgentState) -> str:
     if pe_names:
         periods += f" → {pe_names}"
     line = f"**Data used:** {items} · **Org unit:** {org_txt} · **Period:** {periods}{cat_txt}"
+    formulas = [m for m in metrics if m.get("formula")]
+    for m in formulas:
+        f = m["formula"]
+        line += (f"\n\n**{m.get('label')} formula:** numerator = {f.get('numerator') or '?'}; "
+                 f"denominator = {f.get('denominator') or '?'}"
+                 + (f" ({f.get('type')}, factor {f.get('factor')})" if f.get("type") else ""))
+    numden = ((state.get("dhis2_data") or {}).get("metadata") or {}).get("numden") or []
+    if numden:
+        shown = numden[:15]
+        rows = "\n".join(
+            f"- {r['org']} · {r['period']}: value {r['value']} = numerator {_fmt_num(r['numerator'])} / "
+            f"denominator {_fmt_num(r['denominator'])}" for r in shown
+        )
+        more = f"\n- … {len(numden) - len(shown)} more rows" if len(numden) > len(shown) else ""
+        line += "\n\n**Numerator and denominator (from DHIS2 analytics):**\n" + rows + more
     notes = state.get("resolution_notes") or []
     if notes:
         line += "\n\n" + "\n".join(f"_{n}_" for n in notes)
@@ -676,3 +691,11 @@ def _period_names(state: AgentState) -> str:
     if len(names) <= 3:
         return ", ".join(str(n) for n in names)
     return f"{names[0]} … {names[-1]} ({len(names)} periods with data)"
+
+
+def _fmt_num(v) -> str:
+    try:
+        f = float(v)
+    except (TypeError, ValueError):
+        return str(v)
+    return f"{f:,.0f}" if abs(f - round(f)) < 1e-9 else f"{f:,.2f}"
