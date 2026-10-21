@@ -173,6 +173,22 @@ async def resolve_metadata(state: AgentState, settings: Settings) -> AgentState:
                 extra={"low_confidence_metrics": labels},
             )
         else:
+            # Weak matches (a single shared word, or the LLM re-ranker said none
+            # of the candidates fit) used to be promoted silently, e.g.
+            # "COVID-19 booster doses" -> "PCV3 doses given". For a health
+            # analyst a wrong indicator is worse than a question, so ask.
+            weak = [
+                m for m in metrics
+                if m.get("uid") and m["uid"] != "UNRESOLVED"
+                and m.get("uid_confidence", 0) < _WEAK_MATCH_CONFIDENCE
+            ]
+            if weak:
+                question = await _weak_match_question(weak, settings)
+                logger.info("weak_match_clarification", extra={"labels": [m.get("label") for m in weak]})
+                state["clarification_needed"] = True
+                state["clarification_question"] = question
+                state["metrics"] = metrics
+                return state
             # Auto-resolve: bump confidence of best match so it clears the gate
             for m in metrics:
                 if m.get("uid") and m["uid"] != "UNRESOLVED" and m["uid_confidence"] < threshold:
@@ -272,6 +288,35 @@ async def resolve_metadata(state: AgentState, settings: Settings) -> AgentState:
         }
     )
     return state
+
+
+# Below this, a match shares only one word with the request (keyword cascade
+# strategy 5 = 0.72) or the LLM re-ranker rejected every candidate.
+_WEAK_MATCH_CONFIDENCE = 0.75
+
+
+async def _weak_match_question(weak: list[dict], settings: Settings) -> str:
+    from backend.app.db.metadata_index import search_indicator_by_name
+    from backend.app.db.session import get_db_session
+
+    parts = []
+    try:
+        async with get_db_session() as session:
+            for m in weak:
+                cands = await search_indicator_by_name(
+                    session, m.get("label", ""), is_postgres=settings.is_postgres, limit=4
+                )
+                names = [c.get("label") for c in cands if c.get("label")]
+                parts.append((m.get("label", "that"), names))
+    except Exception:
+        parts = [(m.get("label", "that"), []) for m in weak]
+    lines = []
+    for label, names in parts:
+        if names:
+            lines.append(f"I couldn't find a close match for \u201c{label}\u201d. The nearest items in this DHIS2 instance are: " + "; ".join(names) + ".")
+        else:
+            lines.append(f"I couldn't find \u201c{label}\u201d in this DHIS2 instance.")
+    return " ".join(lines) + " Which one do you mean? You can also type the exact indicator or data element name."
 
 
 _REPORTING_RE = re.compile(
