@@ -57,6 +57,10 @@ class Settings(SettingsBase):
     redis_url: str = ""
     jwt_secret: str = "change-me-in-production"
     jwt_expire_seconds: int = 3600
+    # Standalone mode: if set, /auth/login only accepts this password (any
+    # username). Leave empty for local use; SET IT for any hosted demo, or
+    # anyone with the URL can log in and spend the LLM quota.
+    standalone_access_code: str = ""
 
     # File storage
     temp_file_dir: str = "/tmp/dhis2_analyst"

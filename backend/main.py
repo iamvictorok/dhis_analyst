@@ -10,6 +10,7 @@ Features:
 from __future__ import annotations
 
 import asyncio
+import hmac
 import logging
 import time
 from contextlib import asynccontextmanager
@@ -665,6 +666,12 @@ async def login(request: LoginRequest, settings: Settings = Depends(get_settings
     # Replace this block with your credential store validation.
     if not request.username or not request.password:
         raise HTTPException(status_code=422, detail="username and password are required")
+
+    if settings.standalone_access_code and not hmac.compare_digest(
+        request.password.encode(), settings.standalone_access_code.encode()
+    ):
+        logger.info("login_rejected", extra={"user_id": request.username})
+        raise HTTPException(status_code=401, detail="Invalid username or password")
 
     identity = Identity(
         user_id=request.username,
