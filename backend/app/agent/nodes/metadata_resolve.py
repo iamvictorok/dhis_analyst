@@ -47,6 +47,36 @@ async def resolve_metadata(state: AgentState, settings: Settings) -> AgentState:
     # --- Metric resolution ---
     threshold = settings.metadata_confidence_threshold
     metadata_lookup_failed = False
+
+    # 0. The user typed exact DHIS2 names (e.g. "IDSR Malaria"): trust them over
+    #    whatever label the LLM paraphrased them into ("Malaria case").
+    try:
+        user_text = ""
+        for msg in reversed(state.get("messages") or []):
+            if msg.get("role") == "user":
+                user_text = str(msg.get("content") or "")
+                break
+        exact = await _exact_names_in_message(user_text, settings) if user_text else []
+        if exact and len(exact) == len(metrics):
+            current = {str(m.get("label", "")).lower() for m in metrics}
+            if current != {e["name"].lower() for e in exact}:
+                logger.info(
+                    "exact_name_override",
+                    extra={"llm_labels": sorted(current), "exact_names": [e["name"] for e in exact]},
+                )
+            metrics = [
+                {
+                    **(metrics[i] if i < len(metrics) else {}),
+                    "label": e["name"],
+                    "uid": e["uid"],
+                    "uid_confidence": 0.97,
+                    "object_type": e["object_type"],
+                }
+                for i, e in enumerate(exact)
+            ]
+            state["metrics"] = metrics
+    except Exception as exc:  # never block the pipeline on this shortcut
+        logger.warning("exact_name_scan_failed", extra={"error": str(exc)})
     low_confidence = [m for m in metrics if m["uid_confidence"] < threshold]
 
     # 1. pgvector semantic resolution (Postgres with real embeddings only).
@@ -214,6 +244,45 @@ async def resolve_metadata(state: AgentState, settings: Settings) -> AgentState:
         }
     )
     return state
+
+
+async def _exact_names_in_message(message: str, settings: Settings) -> list[dict]:
+    """Indicator / data element / program indicator names quoted verbatim in the message.
+
+    Whole-word, case-insensitive, at least 6 characters; names contained in a
+    longer matched name are dropped ("ANC 1" inside "ANC 1 Coverage"). Returned
+    in the order they appear in the message.
+    """
+    from sqlalchemy import text
+    from backend.app.db.session import get_db_session
+
+    msg = " ".join(message.split())
+    if len(msg) < 6:
+        return []
+    table = "metadata_index" if settings.is_postgres else "metadata_index_fts"
+    where_contains = (
+        "POSITION(LOWER(name) IN LOWER(:msg)) > 0" if settings.is_postgres else "INSTR(LOWER(:msg), LOWER(name)) > 0"
+    )
+    async with get_db_session() as session:
+        rows = (await session.execute(
+            text(f"""
+                SELECT uid, name, object_type FROM {table}
+                WHERE object_type IN ('indicator', 'dataElement', 'programIndicator')
+                  AND LENGTH(name) >= 6 AND {where_contains}
+            """),
+            {"msg": msg},
+        )).fetchall()
+    found: dict[str, dict] = {}
+    low = msg.lower()
+    for uid, name, obj_type in rows:
+        n = " ".join(str(name).split())
+        m = re.search(r"(?<![A-Za-z0-9])" + re.escape(n.lower()) + r"(?![A-Za-z0-9])", low)
+        if m and n.lower() not in found:
+            found[n.lower()] = {"uid": uid, "name": n, "object_type": obj_type, "pos": m.start()}
+    names = list(found)
+    keep = [v for k, v in found.items() if not any(k != o and k in o for o in names)]
+    keep.sort(key=lambda v: v["pos"])
+    return keep
 
 
 def _looks_like_dhis2_uid(uid: str) -> bool:
