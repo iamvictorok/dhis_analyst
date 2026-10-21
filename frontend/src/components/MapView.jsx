@@ -92,11 +92,17 @@ export default function MapView({ map }) {
     const full = map.title || 'Map';
     const pl = map.period_label || '';
     const head = pl && full.endsWith(`, ${pl}`) ? full.slice(0, -(pl.length + 2)) : full;
-    const titleText = pl && head !== full ? `${esc(head)}<br><span style="font-size:14px;color:#475569">${esc(pl)}</span>` : esc(full);
+    const titleText = esc(head);
+    const subtitle = pl && head !== full ? esc(pl) : '';
     const layout = {
-      title: { text: titleText, font: { size: 18, color: '#0f172a' }, x: 0.01, xanchor: 'left', y: 0.985, yanchor: 'top' },
+      title: {
+        text: titleText,
+        font: { size: 18, color: '#0f172a' },
+        subtitle: { text: subtitle, font: { size: 14, color: '#475569' } },
+        x: 0.01, xanchor: 'left',
+      },
       height: MAP_HEIGHT,
-      margin: { l: 0, r: 0, t: 66, b: 0 },
+      margin: { l: 0, r: 0, t: 72, b: 0 },
       paper_bgcolor: '#ffffff',
       map: { style: 'carto-positron', center, zoom },
       legend: {
