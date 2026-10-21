@@ -41,6 +41,10 @@ _TRANSIENT_MARKERS = (
 )
 
 
+_PRIMARY_DOWN_UNTIL: dict[str, float] = {}
+_BREAKER_SECONDS = 180.0
+
+
 def _is_transient(exc: Exception) -> bool:
     text = f"{type(exc).__name__} {exc}".lower()
     return any(m in text for m in _TRANSIENT_MARKERS)
@@ -84,6 +88,10 @@ async def complete(
         return _mock_completion(messages, json_mode=json_mode)
 
     try:
+        import os as _os
+        # Use the bundled model cost map instead of fetching it from GitHub on
+        # first import (slow on a cold free-tier instance).
+        _os.environ.setdefault("LITELLM_LOCAL_MODEL_COST_MAP", "True")
         import litellm
 
         # Let LiteLLM drop provider-unsupported params (e.g. response_format on
@@ -122,12 +130,23 @@ async def complete(
         )
 
         start = time.monotonic()
-        candidates = [model] + _fallback_models(settings, model)
+        fallbacks = _fallback_models(settings, model)
+        candidates = [model] + fallbacks
         retries = max(0, int(settings.llm_transient_retries))
+        # Circuit breaker: right after the primary model exhausted its retries
+        # on transient errors (e.g. Gemini 503 "high demand"), go straight to
+        # the fallback for a few minutes, keeping the primary as the last resort
+        # with a single attempt. Saves ~10-20 s of doomed retries per call.
+        breaker_open = bool(fallbacks) and _PRIMARY_DOWN_UNTIL.get(model, 0.0) > time.monotonic()
+        if breaker_open:
+            candidates = fallbacks + [model]
         last_exc: Exception | None = None
         for idx, candidate in enumerate(candidates):
             # Primary gets the full retry budget; each fallback gets one retry.
-            attempts = 1 + (retries if idx == 0 else min(retries, 1))
+            is_primary = candidate == model
+            attempts = 1 + (retries if (is_primary and not breaker_open) else min(retries, 1))
+            if breaker_open and is_primary:
+                attempts = 1
             for attempt in range(attempts):
                 try:
                     response = await litellm.acompletion(**{**kwargs, "model": candidate})
@@ -141,9 +160,13 @@ async def complete(
                     )
                     if attempt + 1 < attempts:
                         await asyncio.sleep(settings.llm_retry_backoff_seconds * (2 ** attempt))
+                    elif is_primary and fallbacks:
+                        _PRIMARY_DOWN_UNTIL[model] = time.monotonic() + _BREAKER_SECONDS
                     continue
                 content = response.choices[0].message.content or ""
-                _record_call({"model": candidate, "fallback": idx > 0, "attempt": attempt + 1,
+                if is_primary:
+                    _PRIMARY_DOWN_UNTIL.pop(model, None)
+                _record_call({"model": candidate, "fallback": not is_primary, "breaker": breaker_open, "attempt": attempt + 1,
                               "seconds": round(time.monotonic() - start, 2), "json": json_mode})
                 logger.info(
                     "llm_call_ok",

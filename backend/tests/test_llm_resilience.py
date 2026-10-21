@@ -8,6 +8,13 @@ from backend.app import llm
 from backend.config import Settings
 
 
+@pytest.fixture(autouse=True)
+def _reset_breaker():
+    llm._PRIMARY_DOWN_UNTIL.clear()
+    yield
+    llm._PRIMARY_DOWN_UNTIL.clear()
+
+
 def _settings(**kw):
     base = dict(llm_provider="gemini", llm_model="gemini/gemini-flash-latest", llm_api_key="k",
                 llm_retry_backoff_seconds=0.0)
@@ -60,3 +67,21 @@ def test_fallbacks_can_be_disabled(monkeypatch):
     with pytest.raises(RuntimeError):
         asyncio.run(llm.complete([{"role": "user", "content": "x"}], _settings(llm_fallback_models="none")))
     assert set(calls) == {"gemini/gemini-flash-latest"}
+
+
+def test_breaker_skips_primary_retries_after_it_failed(monkeypatch):
+    def b(m, n):
+        return RuntimeError("503 high demand") if m == "gemini/gemini-flash-latest" else "lite"
+    calls = _patch(monkeypatch, b)
+    msgs = [{"role": "user", "content": "x"}]
+    assert asyncio.run(llm.complete(msgs, _settings())) == "lite"
+    calls.clear()
+    assert asyncio.run(llm.complete(msgs, _settings())) == "lite"
+    assert calls == ["gemini/gemini-flash-lite-latest"]
+
+
+def test_breaker_closes_when_primary_recovers(monkeypatch):
+    llm._PRIMARY_DOWN_UNTIL["gemini/gemini-flash-latest"] = 0.0  # expired
+    calls = _patch(monkeypatch, lambda m, n: "primary")
+    assert asyncio.run(llm.complete([{"role": "user", "content": "x"}], _settings())) == "primary"
+    assert calls == ["gemini/gemini-flash-latest"]
