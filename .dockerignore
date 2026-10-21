@@ -40,3 +40,12 @@ Dockerfile
 # Documentation
 *.md
 dhis2-ai-analyst-spec.md
+
+# Build outputs / local state (rebuilt inside the image)
+**/node_modules/
+**/__pycache__/
+frontend/dist/
+*.db
+*.db-shm
+*.db-wal
+.env.*
