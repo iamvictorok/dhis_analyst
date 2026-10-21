@@ -48,6 +48,29 @@ async def resolve_metadata(state: AgentState, settings: Settings) -> AgentState:
     threshold = settings.metadata_confidence_threshold
     metadata_lookup_failed = False
 
+    reporting_rate_resolved = False
+    # 0a. Data set reporting rates / completeness / timeliness. These are not
+    #     indicators or data elements, so the cascade below can never find them
+    #     and used to silently substitute an unrelated indicator.
+    try:
+        user_text_rr = ""
+        for msg in reversed(state.get("messages") or []):
+            if msg.get("role") == "user":
+                user_text_rr = str(msg.get("content") or "")
+                break
+        rr = await _reporting_rate_metric(user_text_rr, settings, token=state.get("_dhis2_token"))
+        if rr is not None:
+            if rr.get("clarify"):
+                state["clarification_needed"] = True
+                state["clarification_question"] = rr["clarify"]
+                return state
+            state["metrics"] = [rr]
+            metrics = state["metrics"]
+            reporting_rate_resolved = True
+            logger.info("reporting_rate_resolved", extra={"uid": rr["uid"], "label": rr["label"]})
+    except Exception as exc:
+        logger.warning("reporting_rate_scan_failed", extra={"error": str(exc)})
+
     # 0. The user typed exact DHIS2 names (e.g. "IDSR Malaria"): trust them over
     #    whatever label the LLM paraphrased them into ("Malaria case").
     try:
@@ -56,7 +79,10 @@ async def resolve_metadata(state: AgentState, settings: Settings) -> AgentState:
             if msg.get("role") == "user":
                 user_text = str(msg.get("content") or "")
                 break
-        exact = await _exact_names_in_message(user_text, settings) if user_text else []
+        exact = (
+            await _exact_names_in_message(user_text, settings)
+            if user_text and not reporting_rate_resolved else []
+        )
         if exact and len(exact) == len(metrics):
             current = {str(m.get("label", "")).lower() for m in metrics}
             if current != {e["name"].lower() for e in exact}:
@@ -78,6 +104,8 @@ async def resolve_metadata(state: AgentState, settings: Settings) -> AgentState:
     except Exception as exc:  # never block the pipeline on this shortcut
         logger.warning("exact_name_scan_failed", extra={"error": str(exc)})
     low_confidence = [m for m in metrics if m["uid_confidence"] < threshold]
+    if reporting_rate_resolved:
+        low_confidence = []
 
     # 1. pgvector semantic resolution (Postgres with real embeddings only).
     if low_confidence and settings.is_postgres:
@@ -244,6 +272,47 @@ async def resolve_metadata(state: AgentState, settings: Settings) -> AgentState:
         }
     )
     return state
+
+
+_REPORTING_RE = re.compile(
+    r"\b(reporting\s+rates?|report(?:ing)?\s+completeness|completeness|timeliness|"
+    r"reports?\s+(?:received|submitted|on\s+time))\b",
+    re.I,
+)
+
+
+async def _reporting_rate_metric(message: str, settings: Settings, token: str | None = None) -> dict | None:
+    """Map 'reporting rate / completeness / timeliness of <data set>' to a dx item.
+
+    Returns None when the message is not about reporting, a metric dict
+    (object_type 'reportingRate', uid '<dataSet>.REPORTING_RATE[_ON_TIME]') when
+    a data set name is found in the message, or {"clarify": ...} listing data
+    sets when none is named.
+    """
+    if not message or not _REPORTING_RE.search(message):
+        return None
+    from backend.app.dhis2.client import DHIS2Client
+
+    client = DHIS2Client(settings, token=token)
+    raw = await client.get("/api/dataSets.json", params={"fields": "id,name", "paging": "false"})
+    data_sets = [d for d in (raw.get("dataSets") or []) if d.get("id") and d.get("name")]
+    low = " ".join(message.lower().split())
+    matches = [
+        d for d in data_sets
+        if re.search(r"(?<![a-z0-9])" + re.escape(" ".join(d["name"].lower().split())) + r"(?![a-z0-9])", low)
+    ]
+    if not matches:
+        names = ", ".join(sorted(d["name"] for d in data_sets)[:12])
+        return {"clarify": f"Which data set's reporting rate do you mean? For example: {names}."}
+    ds = max(matches, key=lambda d: len(d["name"]))
+    on_time = bool(re.search(r"\b(timeliness|on\s+time|timely)\b", low))
+    suffix = "REPORTING_RATE_ON_TIME" if on_time else "REPORTING_RATE"
+    return {
+        "label": f"{ds['name']} - Reporting rate{' on time' if on_time else ''}",
+        "uid": f"{ds['id']}.{suffix}",
+        "uid_confidence": 0.99,
+        "object_type": "reportingRate",
+    }
 
 
 async def _exact_names_in_message(message: str, settings: Settings) -> list[dict]:

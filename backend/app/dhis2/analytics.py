@@ -9,6 +9,10 @@ from backend.app.agent.state import AgentState
 logger = logging.getLogger("dhis2_analyst.analytics")
 
 DHIS2_UID_RE = re.compile(r"^[A-Za-z][A-Za-z0-9]{10}$")
+# Data set reporting metrics, e.g. "BfMAe6Itzgt.REPORTING_RATE".
+REPORTING_RATE_RE = re.compile(
+    r"^[A-Za-z][A-Za-z0-9]{10}\.(REPORTING_RATE|REPORTING_RATE_ON_TIME|ACTUAL_REPORTS|ACTUAL_REPORTS_ON_TIME|EXPECTED_REPORTS)$"
+)
 
 
 def _join_dimension_items(items: list[str]) -> str:
@@ -32,9 +36,12 @@ def build_analytics_params(state: AgentState) -> dict[str, Any]:
     dx_items = []
     for m in state["metrics"]:
         uid = m.get("uid", "")
+        obj_type = m.get("object_type", "indicator")
+        if obj_type == "reportingRate" and REPORTING_RATE_RE.match(uid or ""):
+            dx_items.append(uid)
+            continue
         if not uid or uid == "UNRESOLVED" or not DHIS2_UID_RE.match(uid):
             continue
-        obj_type = m.get("object_type", "indicator")
         if obj_type not in _DX_VALID_TYPES:
             logger.warning(
                 "analytics_dx_type_mismatch",
