@@ -8,7 +8,7 @@ A step-by-step script for presenting the DHIS2 Analyst. Follow it top to bottom:
 - **Data:** public DHIS2 play instances (`play.im.dhis2.org`), with 2.41.10 as primary and 2.40.12 and 2.42.7 as fallbacks
 - **Model:** Google Gemini Flash (`gemini-flash-latest`), with automatic fallback to Gemini Flash-Lite
 - **Where the figures come from:** QA runs on 21 Oct 2026. Each figure was checked by script against `/api/analytics` on stable-2-41-10. Every step says whether it was checked **on the hosted app** or **locally only**.
-- **Which build was tested:** the hosted checks ran on the Render app across successive commits of branch `audit/demo-fixes-2026-10-21`, from `06db8cd` through `72e3d9a` (the map build). The automated suite (276 tests) passes on `72e3d9a`. To save Gemini quota, not every question was re-run on the final commit, so **rehearse your chosen path on the build you will demo**.
+- **Which build was tested:** the hosted checks ran on the Render app across successive commits of branch `audit/demo-fixes-2026-10-21`, from `06db8cd` through `72e3d9a` (the map build). The automated suite (276 tests) passes on `72e3d9a`; with the report-editing fix (edits now reach the PDF/DOCX) it is 294 backend tests plus 8 frontend unit tests (`cd frontend && npm test`). To save Gemini quota, not every question was re-run on the final commit, so **rehearse your chosen path on the build you will demo**.
 
 ---
 
@@ -285,7 +285,7 @@ Every step, in order.
 - **Talking point:** "The boundaries come from DHIS2 itself, the instance's own geometry, not a shapefile we bundled. Point it at another country's DHIS2 and it draws that country."
 - **Time note:** this was the slowest hosted call (35 s on the backup model). Keep talking while it loads.
 
-#### Step 18. Programme review report → PDF / DOCX (Core · 45 s) ✅ hosted
+#### Step 18. Programme review report → edit → PDF / DOCX (Core · 60 s) ✅ hosted
 - **Click:** chip **Programme review report · ANC 1**
   ```
   Write a programme review report on ANC 1 Coverage in Sierra Leone for the last 12 months
@@ -294,10 +294,13 @@ Every step, in order.
   - the structured report;
   - its figures (mean **102.41**, change **+26.6%** over the window, as of 21 Oct);
   - the **DOCX** and **PDF** buttons.
-- **Do:** click **PDF** (or DOCX) and open the file.
-- **Expected:** in the hosted test, the DOCX opened with 18 paragraphs and the PDF was valid text. The report's mean, peak, low and % change were checked against recomputed values. No invented figures were found.
-- **Talking point:** "A first draft of the quarterly review, with the numbers already checked against DHIS2. The analyst edits the words, not the arithmetic."
-- ⚠️ The report box says **Editable**, but **edits made in the browser are not carried into the download**. Don't edit and then download on stage.
+- **Do:**
+  1. In the report box (it says **Editable**), click into the title and change it, e.g. to `ANC 1 review for the district team`.
+  2. Click at the end of the Executive Summary and add a sentence, e.g. `We will discuss the December dip at the next review meeting.`
+  3. Click **PDF** (or DOCX) and open the file. Your new title and sentence are in it.
+- **Expected:** the downloaded PDF/DOCX contains your edits, with the headings, bullet lists and data table kept. If you edit nothing, the download is the report exactly as generated. In the hosted test (before editing reached the download), the DOCX opened with 18 paragraphs and the PDF was valid text; the report's mean, peak, low and % change were checked against recomputed values, and no invented figures were found. Edit-then-download was verified **locally** (headless Chromium, PDF and DOCX text extracted); rehearse it once on the hosted build.
+- **Talking point:** "A first draft of the quarterly review, with the numbers already checked against DHIS2. The analyst edits the words, not the arithmetic. Edit the report, then download it: what you see in the box is what goes into the Word or PDF file."
+- Keep edits to wording. Typing new figures into the report is possible, but they are then your figures, not DHIS2's.
 
 #### Step 19. Excel export (Core · 30 s) ✅ hosted
 - **Click:** chip **Export ANC 1 by district to Excel**
@@ -426,18 +429,17 @@ These are known weak spots or things that haven't been verified. Don't type them
 2. **Facility point maps.** On the demo database only **54 of 125** Bo facilities have coordinates, so a facility map looks sparse (the missing ones are listed honestly). A chiefdom map was verified locally only, and the Penta 3 map was verified locally but not on the hosted app. **On stage, only use the district ANC 1 map in Step 17.**
 3. **National facility-level maps.** Thousands of points: not paginated, not tested.
 4. **Slides mode / PPTX.** It is in the mode menu, but it was not covered by any QA run.
-5. **Editing the report, then downloading it.** Browser edits are not carried into the PDF/DOCX.
-6. **"Malaria confirmed" wording.** This failed in the first hosted audit, picking an item with zero rows. Later builds answer it via IDSR Malaria, but it's still a known trap. Use "IDSR Malaria".
-7. **"Top N" questions.** An earlier build showed all 13 districts ranked instead of the top 5. The values were right but the list was too long. The "3 lowest" backup question above is fine. Avoid making a point of the exact count.
-8. **Raw UID in the chart title for reporting-rate charts** (e.g. `BfMAe6Itzgt.REPORTING_RATE`). This was seen in the first audit and it is cosmetic. If it shows, say "that's the DHIS2 ID; the label is in the Data used line."
-9. **Questions with no period or place**, other than the deliberate "Show me coverage" in Step 14. For example, "Give me malaria deaths across all districts" picks a different but defensible item.
-10. **Follow-up questions that depend on the previous answer** ("now show that by chiefdom"). Not QA'd.
-11. **Web enrichment or external sources.** Not configured on the demo.
-12. **Triggering a failover live,** or claiming offline mode beyond the five chips.
-13. **Claims about non-Sierra-Leone instances or DHIS2 2.38/2.39.** Covered only by automated tests, not live servers.
-14. **Prompt-injection on stage.** It passed in testing, but the result is slow (about 29 s) and the screen shows little. Mention it in Q&A instead.
-15. **Running the full script more than once on demo day.** It burns the Gemini quota.
-16. **Calling it "in production" or "deployed for clients".** It's a working build on public demo data.
+5. **"Malaria confirmed" wording.** This failed in the first hosted audit, picking an item with zero rows. Later builds answer it via IDSR Malaria, but it's still a known trap. Use "IDSR Malaria".
+6. **"Top N" questions.** An earlier build showed all 13 districts ranked instead of the top 5. The values were right but the list was too long. The "3 lowest" backup question above is fine. Avoid making a point of the exact count.
+7. **Raw UID in the chart title for reporting-rate charts** (e.g. `BfMAe6Itzgt.REPORTING_RATE`). This was seen in the first audit and it is cosmetic. If it shows, say "that's the DHIS2 ID; the label is in the Data used line."
+8. **Questions with no period or place**, other than the deliberate "Show me coverage" in Step 14. For example, "Give me malaria deaths across all districts" picks a different but defensible item.
+9. **Follow-up questions that depend on the previous answer** ("now show that by chiefdom"). Not QA'd.
+10. **Web enrichment or external sources.** Not configured on the demo.
+11. **Triggering a failover live,** or claiming offline mode beyond the five chips.
+12. **Claims about non-Sierra-Leone instances or DHIS2 2.38/2.39.** Covered only by automated tests, not live servers.
+13. **Prompt-injection on stage.** It passed in testing, but the result is slow (about 29 s) and the screen shows little. Mention it in Q&A instead.
+14. **Running the full script more than once on demo day.** It burns the Gemini quota.
+15. **Calling it "in production" or "deployed for clients".** It's a working build on public demo data.
 
 ---
 
@@ -481,7 +483,7 @@ All figures from DHIS2 2.41.10 (play demo database), checked against `/api/analy
 | 15 | COVID-19 booster doses, Bo | "isn't available … haven't substituted" | hosted |
 | 16 | ANC 1 numerator/denominator, SL, 2025 | 103.82 = 253,269 / 243,951 | hosted |
 | 17 | Map: ANC 1 by district, 2025 | 13/13; Bo 146.73 high, Kono 53.81 low | hosted |
-| 18 | Programme review report, ANC 1 | 12 values; mean 102.41, +26.6% (rolling); PDF + DOCX | hosted |
+| 18 | Programme review report, ANC 1 | 12 values; mean 102.41, +26.6% (rolling); PDF + DOCX; edits reach the download (local) | hosted |
 | 19 | Export ANC 1 by district to Excel | 148 rows; sheets Data / Metadata / Sources; CSV | hosted |
 | backup | Penta 1–3 dropout, Kenema, 2025 | 7.75% | hosted |
 | backup | 3 lowest ANC 1 districts, 2025 | Kono 53.81, Koinadugu 68.31, Kailahun 83.22 | hosted |
