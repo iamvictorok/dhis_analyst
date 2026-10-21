@@ -8,19 +8,32 @@ from __future__ import annotations
 
 import logging
 
+from backend.app.generators.html_sanitize import sanitize_report_html
+
 logger = logging.getLogger("dhis2_analyst.pdf_gen")
 
 
 def html_to_pdf(html: str) -> bytes:
-    """Convert report HTML to PDF bytes."""
+    """Convert report HTML to PDF bytes.
+
+    The HTML may be the user's edited report from the browser, so it is
+    sanitised first and WeasyPrint is never allowed to fetch a URL (no local
+    file reads, no requests to internal hosts).
+    """
+    html = sanitize_report_html(html)
     try:
         from weasyprint import HTML
-        result = HTML(string=_wrap(html)).write_pdf()
+        result = HTML(string=_wrap(html), url_fetcher=_deny_fetch).write_pdf()
         logger.info("pdf_generated_weasyprint", extra={"size": len(result)})
         return result
     except Exception as exc:
         logger.warning("weasyprint_fallback", extra={"error": str(exc)})
         return _fallback_pdf(html)
+
+
+def _deny_fetch(url: str, *args, **kwargs):
+    """WeasyPrint url_fetcher that refuses every external resource."""
+    raise ValueError(f"external resources are not allowed in reports: {url[:60]}")
 
 
 def _wrap(html: str) -> str:

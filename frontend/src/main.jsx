@@ -23,6 +23,7 @@ import { sanitizeHtml } from './lib/sanitize.js';
 import Dashboard from './components/Dashboard.jsx';
 import MapView from './components/MapView.jsx';
 import ReportEditor from './components/ReportEditor.jsx';
+import { reportHtmlForExport } from './lib/reportExport.js';
 import DownloadBar from './components/DownloadBar.jsx';
 import CopyButton from './components/CopyButton.jsx';
 import EvidenceTag from './components/EvidenceTag.jsx';
@@ -664,6 +665,11 @@ function MessageBlock({ msg, isLast, isLoading }) {
   const hasSlides = art?.slides?.length > 0;
   const hasExport = !!art?.exportData;
   const [sourcesOpen, setSourcesOpen] = useState(false);
+  // The user's edited report HTML (null = unedited). Exports use it so edits
+  // made in the report editor reach the PDF/DOCX and "Copy HTML".
+  const [editedReportHtml, setEditedReportHtml] = useState(null);
+  useEffect(() => { setEditedReportHtml(null); }, [art?.reportHtml]);
+  const exportReportHtml = reportHtmlForExport(art?.reportHtml, editedReportHtml);
 
   return (
     <div class={`message ${isUser ? 'message-user' : 'message-assistant'}`}>
@@ -740,11 +746,11 @@ function MessageBlock({ msg, isLast, isLoading }) {
                   <span class="badge">Editable</span>
                 </div>
                 <div class="artefact-actions">
-                  <CopyButton text={art.reportHtml} label="Copy HTML" />
-                  <DownloadBar reportHtml={art.reportHtml} allowedFormats={['DOCX', 'PDF']} />
+                  <CopyButton text={exportReportHtml} label="Copy HTML" />
+                  <DownloadBar reportHtml={exportReportHtml} allowedFormats={['DOCX', 'PDF']} />
                 </div>
               </div>
-              <ReportEditor html={art.reportHtml} onChange={() => {}} />
+              <ReportEditor html={art.reportHtml} onChange={setEditedReportHtml} />
             </div>
           )}
 
