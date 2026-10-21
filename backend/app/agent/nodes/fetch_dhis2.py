@@ -19,8 +19,48 @@ from backend.app.dhis2.client import DHIS2Client
 logger = logging.getLogger("dhis2_analyst.fetch_dhis2")
 
 
+_ANALYTICS_TYPES = {"indicator", "dataElement", "programIndicator", "reportingRate"}
+
+
+def effective_strategy(state: AgentState) -> str:
+    """The retrieval path actually used for this request.
+
+    The intent parser picks ``tracker_api`` / ``data_value_sets`` whenever the
+    user mentions a tracker, programme or raw entries, but those paths return
+    unaggregated event lists, need a single resolved org unit, and cannot
+    answer "how many" questions. When every requested item resolved to
+    something the analytics API can aggregate (data elements, indicators,
+    program indicators, reporting rates), answer through analytics instead:
+    program indicators are aggregated there per org unit and period exactly
+    like routine data. The raw paths are kept only for requests with no
+    aggregatable item and a resolved org unit; anything else uses analytics,
+    so a tracker question never fails on the "National" org unit.
+    """
+    from backend.app.dhis2.analytics import DHIS2_UID_RE, REPORTING_RATE_RE
+
+    strategy = state.get("data_retrieval_strategy") or "analytics_api"
+    if strategy not in {"tracker_api", "data_value_sets"}:
+        return strategy
+    metrics = state.get("metrics") or []
+
+    def aggregatable(m: dict) -> bool:
+        uid = str(m.get("uid") or "")
+        return (m.get("object_type") in _ANALYTICS_TYPES
+                and bool(DHIS2_UID_RE.match(uid) or REPORTING_RATE_RE.match(uid)))
+
+    if metrics and all(aggregatable(m) for m in metrics):
+        return "analytics_api"
+    org_uid = str((state.get("org_unit") or {}).get("uid") or "")
+    if not DHIS2_UID_RE.match(org_uid):
+        return "analytics_api"
+    return strategy
+
+
 async def fetch_dhis2(state: AgentState, settings: Settings | None = None) -> AgentState:
-    strategy = state.get("data_retrieval_strategy", "analytics_api")
+    requested = state.get("data_retrieval_strategy", "analytics_api")
+    strategy = effective_strategy(state)
+    if strategy != requested:
+        logger.info("dhis2_strategy_rerouted", extra={"requested": requested, "used": strategy})
 
     has_credentials = bool(
         settings and (

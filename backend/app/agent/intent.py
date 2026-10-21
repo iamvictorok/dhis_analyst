@@ -153,7 +153,7 @@ def classify_intent(
     now = today or date.today()
 
     output_mode = forced_mode or _detect_output_mode(lowered)
-    periods = _detect_periods(lowered, now)
+    periods = expand_periods(lowered, _detect_periods(lowered, now), now)
     needs_web = _needs_web_enrichment(lowered)
 
     return {
@@ -170,6 +170,93 @@ def classify_intent(
         "clarification_needed": not text,
         "clarification_question": "What public health question should I analyse?" if not text else None,
     }
+
+
+# ---------------------------------------------------------------------------
+# Granularity: "monthly / weekly / quarterly ... in 2025" -> period list
+# ---------------------------------------------------------------------------
+_GRANULARITY_RES: list[tuple[str, re.Pattern]] = [
+    ("weekly", re.compile(r"\b(?:weekly|week[- ]by[- ]week|week[- ]on[- ]week|(?:by|per|each|every)\s+week)\b", re.I)),
+    ("monthly", re.compile(r"\b(?:monthly|month[- ]by[- ]month|month[- ]on[- ]month|(?:by|per|each|every)\s+month)\b", re.I)),
+    ("quarterly", re.compile(r"\b(?:quarterly|quarter[- ]by[- ]quarter|quarter[- ]on[- ]quarter|(?:by|per|each|every)\s+quarter)\b", re.I)),
+]
+_YEAR_RANGE_RE = re.compile(r"\b(20\d{2})\s*(?:-|–|—|to|through|thru|until|till)\s*(20\d{2})\b", re.I)
+_RELATIVE_YEAR_TO_LIST = {
+    ("monthly", "THIS_YEAR"): "MONTHS_THIS_YEAR",
+    ("weekly", "THIS_YEAR"): "WEEKS_THIS_YEAR",
+}
+
+
+def detect_granularity(text: str) -> str | None:
+    """'monthly' | 'weekly' | 'quarterly' when the user asks for a time series
+    at that granularity ("monthly trend", "by month", "each quarter")."""
+    for name, rx in _GRANULARITY_RES:
+        if rx.search(text or ""):
+            return name
+    return None
+
+
+def _year_periods(year: int, granularity: str, today: date) -> list[str]:
+    if granularity == "monthly":
+        last = 12 if year < today.year else today.month
+        return [f"{year}{m:02d}" for m in range(1, last + 1)]
+    if granularity == "quarterly":
+        last = 4 if year < today.year else (today.month - 1) // 3 + 1
+        return [f"{year}Q{q}" for q in range(1, last + 1)]
+    # ISO weeks: Dec 28 always falls in the year's last ISO week.
+    n_weeks = date(year, 12, 28).isocalendar()[1]
+    last = n_weeks if year < today.year else min(n_weeks, today.isocalendar()[1])
+    return [f"{year}W{w}" for w in range(1, last + 1)]
+
+
+def expand_periods(message: str, periods: list[str], today: date) -> list[str]:
+    """Generic period post-processing shared by the LLM and keyword classifiers.
+
+    1. A year range ("2022 to 2025") includes every year in between.
+    2. A granularity word plus whole years ("monthly ... in 2025", "quarterly
+       for last year") becomes the list of months/quarters/weeks of those years,
+       so analytics returns a time series instead of one annual total.
+    Periods already finer than a year (months, quarters, LAST_12_MONTHS ...)
+    are left alone.
+    """
+    text = message or ""
+    out = list(periods or [])
+    for a, b in _YEAR_RANGE_RE.findall(text):
+        lo, hi = sorted((int(a), int(b)))
+        if 2000 <= lo and hi - lo <= 15 and hi <= today.year + 1:
+            years = [str(y) for y in range(lo, hi + 1)]
+            out = [p for p in out if p not in years] + years
+    gran = detect_granularity(text)
+    if not gran:
+        return sorted(set(out), key=out.index) if out else out
+    # The user named the year(s) but the parser lost them (e.g. an invalid
+    # relative code replaced by THIS_YEAR): the named years win.
+    named = sorted({y for y in re.findall(r"\b(20\d{2})\b", text) if 2000 <= int(y) <= today.year})
+    if named and not any(p.startswith(y) for p in out for y in named):
+        out = named
+    expanded: list[str] = []
+    for p in out:
+        if re.fullmatch(r"20\d{2}", p):
+            expanded.extend(_year_periods(int(p), gran, today))
+        elif (gran, p) in _RELATIVE_YEAR_TO_LIST:
+            expanded.append(_RELATIVE_YEAR_TO_LIST[(gran, p)])
+        elif p == "THIS_YEAR":
+            expanded.extend(_year_periods(today.year, gran, today))
+        elif p == "LAST_YEAR":
+            expanded.extend(_year_periods(today.year - 1, gran, today))
+        else:
+            expanded.append(p)
+    seen: set[str] = set()
+    return [p for p in sorted(expanded, key=_period_sort_key) if not (p in seen or seen.add(p))]
+
+
+def _period_sort_key(p: str) -> tuple:
+    m = re.fullmatch(r"(20\d{2})(?:(\d{2})|Q(\d)|W(\d{1,2}))?", p)
+    if not m:
+        return (1, p)
+    y, mo, q, w = m.groups()
+    sub = int(mo) if mo else (int(q) * 3 if q else (int(w) / 4.35 if w else 13))
+    return (0, int(y), sub)
 
 
 async def classify_intent_llm(
@@ -695,6 +782,7 @@ def _merge_llm_intent(
             logger.warning("llm_period_rejected", extra={"period": p_stripped})
     if not valid_periods:
         valid_periods = ["THIS_YEAR"]
+    valid_periods = expand_periods(message, valid_periods, today)
 
     # Whitelist the output mode — never trust an LLM-invented enum value.
     raw_mode = parsed.get("output_mode")

@@ -640,7 +640,9 @@ def _data_used_text(state: AgentState) -> str:
     used_cats = [cats.get(d, d) for d in state.get("disaggregations") or [] if d != "ou_children"]
     if used_cats:
         cat_txt = " · **Disaggregated by:** " + ", ".join(used_cats)
-    periods = ", ".join(state.get("periods") or [])
+    pe_list = list(state.get("periods") or [])
+    periods = (", ".join(pe_list) if len(pe_list) <= 4
+               else f"{pe_list[0]} … {pe_list[-1]} ({len(pe_list)} periods)")
     pe_names = _period_names(state)
     if pe_names:
         periods += f" → {pe_names}"

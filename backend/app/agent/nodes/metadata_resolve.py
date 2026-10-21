@@ -388,6 +388,25 @@ _REPORTING_RE = re.compile(
 )
 
 
+# "How timely was Child Health reporting", "reports submitted late",
+# "how complete was EPI reporting": a timeliness/completeness word together
+# with reporting (not the bare output word "report").
+_TIMELY_RE = re.compile(r"\b(timel(?:y|iness)|on[\s-]+time|late(?:ness)?|punctual(?:ity)?)\b", re.I)
+_COMPLETE_RE = re.compile(r"\b(complete(?:ness)?|completion)\b", re.I)
+_REPORTING_WORD_RE = re.compile(r"\breport(?:ing|s|ed)\b", re.I)
+
+
+def is_reporting_question(message: str) -> bool:
+    """Is the question about data set reporting rate / completeness / timeliness?"""
+    if not message:
+        return False
+    if _REPORTING_RE.search(message):
+        return True
+    if _REPORTING_WORD_RE.search(message) and (_TIMELY_RE.search(message) or _COMPLETE_RE.search(message)):
+        return True
+    return False
+
+
 async def _reporting_rate_metric(message: str, settings: Settings, token: str | None = None) -> dict | None:
     """Map 'reporting rate / completeness / timeliness of <data set>' to a dx item.
 
@@ -396,7 +415,7 @@ async def _reporting_rate_metric(message: str, settings: Settings, token: str | 
     a data set name is found in the message, or {"clarify": ...} listing data
     sets when none is named.
     """
-    if not message or not _REPORTING_RE.search(message):
+    if not message or not is_reporting_question(message):
         return None
     from backend.app.dhis2.client import DHIS2Client
 
@@ -412,7 +431,7 @@ async def _reporting_rate_metric(message: str, settings: Settings, token: str | 
         names = ", ".join(sorted(d["name"] for d in data_sets)[:12])
         return {"clarify": f"Which data set's reporting rate do you mean? For example: {names}."}
     ds = max(matches, key=lambda d: len(d["name"]))
-    on_time = bool(re.search(r"\b(timeliness|on\s+time|timely)\b", low))
+    on_time = bool(_TIMELY_RE.search(low))
     suffix = "REPORTING_RATE_ON_TIME" if on_time else "REPORTING_RATE"
     return {
         "label": f"{ds['name']} - Reporting rate{' on time' if on_time else ''}",
@@ -1140,11 +1159,15 @@ async def _expert_resolve(state: AgentState, settings: Settings) -> dict:
         if verdict is None:
             use_user = q_user and len(metrics) == 1
             rescored = [{**c, "score": c["user_score"] if use_user else c["score"]} for c in shown]
-            verdict = R.deterministic_judge(q_user, rescored, unknown)
+            verdict = R.deterministic_judge(q_user, rescored, unknown,
+                                            prefer_program=R.mentions_tracker(user_text))
         verdict["candidates"] = shown
         verdict["label"] = label
         if verdict["decision"] == "match":
             _prefer_aggregate(verdict, user_text, q_user, cat, R)
+            if len(metrics) == 1:
+                R.prefer_program(verdict, user_text)
+                R.prefer_measure_type(verdict, user_text)
         return verdict
 
     verdicts = await asyncio.gather(*(one(i) for i in todo))

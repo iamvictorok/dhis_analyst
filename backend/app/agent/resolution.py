@@ -58,6 +58,8 @@ year years month months quarter quarters week weeks weekly monthly quarterly ann
 last this past previous current recent financial fiscal so far to date ytd since during over under
 january february march april may june july august september october november december
 jan feb mar apr jun jul aug sep sept oct nov dec q
+tracker recorded record captured entered nationally nationwide overall
+as into using via line lines bar bars pie scatter heatmap visual visualise visualize plot plotted
 national country district districts region regions province provinces chiefdom chiefdoms facility facilities
 level levels area areas org unit units organisation organization health centre center clinic clinics hospital
 hospitals phu phus sub county counties state states lga ward wards zone zones
@@ -103,6 +105,8 @@ def tokens(text: str) -> list[str]:
     out = []
     for w in re.findall(r"[a-z]+|\d+", t):
         w = _ORDINALS.get(w, w)
+        # British/American spelling: immunised/immunized, organisation/organization.
+        w = re.sub(r"^([a-z]{3,})is(e|ed|es|ing|ation|ations)$", r"\1iz\2", w)
         if len(w) > 4 and w.endswith("ies"):
             w = w[:-3] + "y"
         elif len(w) > 4 and w.endswith("s") and not w.endswith(("ss", "us", "is")):
@@ -117,6 +121,8 @@ def content_tokens(text: str, extra_stop: set[str] | None = None) -> list[str]:
     for w in tokens(text):
         if w in stop or (len(w) < 2 and not w.isdigit()):
             continue
+        if len(w) == 4 and w.isdigit() and 1990 <= int(w) <= 2100:
+            continue  # a year is a period, never part of a data item name
         if w not in seen:
             seen.add(w)
             out.append(w)
@@ -462,7 +468,94 @@ def mentions_tracker(text: str) -> bool:
     return bool(_TRACKER_WORDS.search(text or ""))
 
 
-def deterministic_judge(q_user: list[str], cands: list[dict], unknown: list[str]) -> dict:
+_COUNT_WORDS = re.compile(
+    r"\b(how\s+many|number\s+of|numbers\s+of|count(?:s|ed)?|totals?|children|child|kids?|babies|infants?|"
+    r"cases?|doses?|visits?|deaths?|births?|deliveries|patients?|people|persons?|women|girls|boys|clients?|"
+    r"attendances?|admissions?)\b",
+    re.I,
+)
+
+
+def asks_for_count(text: str) -> bool:
+    """The user wants a count (data element) rather than a rate (indicator).
+
+    Rate words win: "BCG coverage among children" is a coverage question.
+    """
+    return bool(_COUNT_WORDS.search(text or "")) and not asks_for_rate(text)
+
+
+def _fit(c: dict) -> float:
+    return float(c.get("user_score", c.get("score", 0.0)) or 0.0)
+
+
+def _available_like(c: dict, chosen: dict) -> bool:
+    """Candidate holds data, or availability is unknown for both."""
+    return c.get("has_data") is True or (c.get("has_data") is None and chosen.get("has_data") is None)
+
+
+def _switch(verdict: dict, j: int, tag: str) -> None:
+    old = verdict["choice"]
+    if j == old:
+        return
+    verdict["choice"] = j
+    verdict["alternatives"] = [old] + [k for k in verdict.get("alternatives") or [] if k not in (j, old)]
+    verdict["by"] = f"{verdict.get('by')}+{tag}"
+
+
+def prefer_measure_type(verdict: dict, user_text: str, min_fit: float = 0.5, margin: float = 0.05) -> None:
+    """Counts vs rates, decided by the user's own words (generic DHIS2 convention).
+
+    "children / cases / doses / how many" -> a data element (the count);
+    "% / coverage / rate" -> an indicator. Switch only to a candidate that fits
+    the user's words at least as well (within ``margin``) and holds data, so a
+    precise item is never traded for a vaguer one of the other type.
+    """
+    if verdict.get("decision") != "match":
+        return
+    cands = verdict.get("candidates") or []
+    if not (1 <= verdict.get("choice", 0) <= len(cands)):
+        return
+    chosen = cands[verdict["choice"] - 1]
+    if asks_for_rate(user_text):
+        want, have = "indicator", {"dataElement"}
+    elif asks_for_count(user_text):
+        want, have = "dataElement", {"indicator"}
+    else:
+        return
+    if chosen.get("object_type") not in have:
+        return
+    floor = max(min_fit, _fit(chosen) - margin)
+    pool = [(k, c) for k, c in enumerate(cands, 1)
+            if c.get("object_type") == want and _fit(c) >= floor and _available_like(c, chosen)]
+    if pool:
+        k, _ = max(pool, key=lambda kc: (_fit(kc[1]), kc[1].get("has_data") is True, -len(kc[1]["label"])))
+        _switch(verdict, k, "count" if want == "dataElement" else "rate")
+
+
+def prefer_program(verdict: dict, user_text: str, min_fit: float = 0.5, margin: float = 0.05) -> None:
+    """User named a tracker/programme source: answer from a program indicator
+    (aggregated through analytics) when one fits the words as well as the
+    routine item. Programme-name overlap with the question breaks ties."""
+    if verdict.get("decision") != "match" or not mentions_tracker(user_text):
+        return
+    cands = verdict.get("candidates") or []
+    if not (1 <= verdict.get("choice", 0) <= len(cands)):
+        return
+    chosen = cands[verdict["choice"] - 1]
+    if chosen.get("object_type") == "programIndicator":
+        return
+    floor = max(min_fit, _fit(chosen) - margin)
+    qset = set(tokens(user_text))
+    pool = [(k, c) for k, c in enumerate(cands, 1)
+            if c.get("object_type") == "programIndicator" and _fit(c) >= floor and _available_like(c, chosen)]
+    if pool:
+        k, _ = max(pool, key=lambda kc: (len(qset & set(tokens(kc[1].get("source") or ""))),
+                                         _fit(kc[1]), -len(kc[1]["label"])))
+        _switch(verdict, k, "program")
+
+
+def deterministic_judge(q_user: list[str], cands: list[dict], unknown: list[str],
+                        prefer_program: bool = False) -> dict:
     """Fallback when no LLM is available: conservative thresholds."""
     if not cands:
         return {"decision": "not_available", "choice": 0, "alternatives": [], "options": [], "by": "rules"}
@@ -471,7 +564,7 @@ def deterministic_judge(q_user: list[str], cands: list[dict], unknown: list[str]
     ranked = sorted(range(len(cands)), key=lambda i: -(
         cands[i]["score"]
         + (0.03 if cands[i].get("has_data") else 0)
-        + (0.02 if cands[i].get("object_type") != "programIndicator" else 0)
+        + (0.02 if (cands[i].get("object_type") == "programIndicator") == prefer_program else 0)
     ))
     top = cands[ranked[0]]["score"]
     if top < 0.35 or (unknown and top < 0.75):
