@@ -1029,6 +1029,11 @@ async def _apply_breakdown_level(state: AgentState, settings: Settings) -> None:
         disaggs = [d for d in disaggs if d != "ou_children"]
     if wanted is None and "ou_children" in disaggs:
         wanted = org_level + 1
+    if wanted is None and state.get("output_mode") == "map" and levels:
+        # A map of one place needs its sub-units: default one level down
+        # (unless the place already is the lowest level).
+        if any(l["level"] == org_level + 1 for l in levels):
+            wanted = org_level + 1
     if wanted is not None and wanted > org_level:
         org["breakdown_level"] = wanted
         org["breakdown_level_name"] = level_name(wanted, levels)

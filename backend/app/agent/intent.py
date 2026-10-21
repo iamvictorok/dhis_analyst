@@ -152,7 +152,7 @@ def classify_intent(
     lowered = text.lower()
     now = today or date.today()
 
-    output_mode = forced_mode or _detect_output_mode(lowered)
+    output_mode = decide_map_mode(text, forced_mode or _detect_output_mode(lowered), forced_mode)
     periods = expand_periods(lowered, _detect_periods(lowered, now), now)
     needs_web = _needs_web_enrichment(lowered)
 
@@ -306,7 +306,7 @@ Output mode — use ONE of:
 - report: request for a formal narrative document or summary
 - presentation: request for slide deck or presentation
 - export: request to download raw data (CSV, Excel, etc)
-- map: request for a geospatial map, heat map, or geographical distribution
+- map: ONLY when the user explicitly asks for a map, choropleth, heat map or "where" something is highest/lowest. A plain "by district" breakdown is dashboard, not map.
 
 Return JSON with these exact keys:
 {{
@@ -520,6 +520,54 @@ def _scrub_pii(text: str) -> str:
     text = re.sub(r"\b(patient|person)\s+([A-Z][a-z]+\s+[A-Z][a-z]+)\b", r"\1 [REDACTED_NAME]", text)
     return text
 
+# ---------------------------------------------------------------------------
+# Map intent: only an explicit map / spatial cue makes a map. "by district"
+# alone is a breakdown (chart or table), not a map request.
+# ---------------------------------------------------------------------------
+_MAP_WORD_RE = re.compile(
+    r"\b(?:maps?|mapped|mapping|choropleth|heat[\s-]?maps?|geo[\s-]?spatial\w*|spatial\w*|"
+    r"geographic(?:al|ally)?\s+(?:distribution|spread|pattern|view|breakdown|variation)s?|hot\s?spots?)\b",
+    re.I,
+)
+_WHERE_RE = re.compile(
+    r"\bwhere\b[^?.!]*\b(?:highest|lowest|most|least|worst|best|higher|lower|high|low|concentrated|"
+    r"clustered|located|spread|distributed|hot\s?spots?|burden|problems?|gaps?|struggling|lagging|performing)\b",
+    re.I,
+)
+_NON_MAP_OUTPUT_RE = re.compile(
+    r"\b(?:slides?|presentation|deck|pptx|report|briefing|write[\s-]?up|excel|xlsx|csv|download|export)\b", re.I)
+
+
+def wants_map(message: str) -> bool:
+    """True when the user explicitly asks for a map or a spatial "where" answer."""
+    if not message:
+        return False
+    text = " ".join(message.split())
+    # "roadmap", "mind map" style words are not geography.
+    text = re.sub(r"\b(?:road|mind|site|heart)\s?maps?\b", " ", text, flags=re.I)
+    return bool(_MAP_WORD_RE.search(text) or _WHERE_RE.search(text))
+
+
+def decide_map_mode(message: str, candidate: str, forced_mode: str | None = None) -> str:
+    """Final output mode with the map rules applied.
+
+    - A mode the user picked in the UI always wins.
+    - An explicit map cue turns a chart/answer into a map (not a report,
+      slides or export the user also asked for).
+    - "map" without any map cue in the message (the LLM read "by district" as
+      a map) becomes a dashboard, so no spurious map / "coming soon" note.
+    """
+    if forced_mode:
+        return forced_mode
+    if wants_map(message):
+        if candidate in ("dashboard", "conversational", "map") and not _NON_MAP_OUTPUT_RE.search(message):
+            return "map"
+        return candidate if candidate != "map" else "dashboard"
+    if candidate == "map":
+        return "dashboard"
+    return candidate
+
+
 def _detect_output_mode(text: str) -> OutputMode:
     if any(w in text for w in ("slide", "presentation", "briefing deck", "pptx")):
         return "presentation"
@@ -698,7 +746,7 @@ def _needs_web_enrichment(text: str) -> bool:
 
 
 def _detect_viz_types(text: str, mode: OutputMode) -> list[str]:
-    if "map" in text:
+    if mode == "map":
         return ["map"]
     if "pie" in text:
         return ["pie"]
@@ -794,6 +842,7 @@ def _merge_llm_intent(
         if raw_mode is not None:
             logger.warning("llm_output_mode_rejected", extra={"output_mode": raw_mode})
         output_mode = "conversational"
+    output_mode = decide_map_mode(message, output_mode, forced_mode)
 
     disaggregations = parsed.get("disaggregations")
     if not isinstance(disaggregations, list):

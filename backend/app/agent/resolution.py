@@ -583,14 +583,26 @@ def deterministic_judge(q_user: list[str], cands: list[dict], unknown: list[str]
 # Org-unit levels and breakdown parsing
 # ---------------------------------------------------------------------------
 
-_LEVELS_CACHE: dict[str, Any] = {"expires": 0.0, "levels": None}
-
+_LEVELS_CACHE: dict[str, Any] = {"expires": 0.0, "levels": None, "key": None}
 _FACILITY_WORDS = r"(?:health\s+)?(?:facilit(?:y|ies)|clinics?|hospitals?|phus?|health\s+cent(?:re|er)s?|health\s+posts?)"
+
+
+def _levels_instance_key(settings: Settings, token: str | None) -> str:
+    """Which DHIS2 instance the levels belong to (levels differ per instance)."""
+    try:
+        if token:
+            return settings.dhis2_base_url.rstrip("/")
+        from backend.app.dhis2 import failover
+        mode, base = failover.current_target(settings)
+        return base or mode
+    except Exception:
+        return str(getattr(settings, "dhis2_base_url", "") or "")
 
 
 async def org_levels(settings: Settings, token: str | None = None) -> list[dict] | None:
     now = time.time()
-    if _LEVELS_CACHE["levels"] and _LEVELS_CACHE["expires"] > now:
+    key = _levels_instance_key(settings, token)
+    if _LEVELS_CACHE["levels"] and _LEVELS_CACHE["expires"] > now and _LEVELS_CACHE.get("key") == key:
         return _LEVELS_CACHE["levels"]
     try:
         from backend.app.dhis2.client import DHIS2Client
@@ -601,7 +613,7 @@ async def org_levels(settings: Settings, token: str | None = None) -> list[dict]
              if l.get("level") and l.get("name")],
             key=lambda l: l["level"])
         if levels:
-            _LEVELS_CACHE.update(levels=levels, expires=now + 3600)
+            _LEVELS_CACHE.update(levels=levels, expires=now + 3600, key=key)
             return levels
     except Exception as exc:
         logger.info("org_levels_unavailable", extra={"error": str(exc)[:200]})

@@ -213,6 +213,9 @@ class DHIS2Client:
                             "likely redirected to the login page (missing/invalid credentials)."
                         )
                     payload = response.json()
+                    if isinstance(payload, list) and "geoFeatures" in path:
+                        # /api/geoFeatures answers with a bare JSON array.
+                        payload = {"geoFeatures": payload}
                     if not isinstance(payload, dict):
                         raise ValueError("DHIS2 returned a non-object JSON payload.")
                     logger.info(

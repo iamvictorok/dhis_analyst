@@ -60,10 +60,18 @@ def test_unknown_output_mode_is_coerced_to_conversational():
     assert result["output_mode"] == "conversational"
 
 
-def test_map_output_mode_is_accepted():
+def test_map_output_mode_is_accepted_when_user_asks_for_a_map():
+    result = merge({"output_mode": "map", "metrics": [{"label": "x"}],
+                    "org_unit_label": "Kaduna", "periods": ["THIS_YEAR"]},
+                   message="show me the data on a map")
+    assert result["output_mode"] == "map"
+
+
+def test_llm_map_without_any_map_cue_becomes_dashboard():
+    # The model read a breakdown as a map; nothing in the message asks for one.
     result = merge({"output_mode": "map", "metrics": [{"label": "x"}],
                     "org_unit_label": "Kaduna", "periods": ["THIS_YEAR"]})
-    assert result["output_mode"] == "map"
+    assert result["output_mode"] == "dashboard"
 
 
 def test_llm_supplied_uid_is_not_trusted():

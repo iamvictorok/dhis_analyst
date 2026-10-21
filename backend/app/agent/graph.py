@@ -19,6 +19,7 @@ from typing import Any, Awaitable, Callable
 
 from backend.config import Settings
 from backend.app.agent.intent import classify_intent_llm
+from backend.app.agent.map_builder import MapUnavailable, build_map, export_payload_from_map
 from backend.app.agent.nodes.enrich_web import enrich_web
 from backend.app.agent.nodes.evidence_fusion import fuse_evidence
 from backend.app.agent.nodes.fetch_dhis2 import fetch_dhis2
@@ -193,11 +194,10 @@ async def run_agent_stream(
         yield sse("done")
         return
 
-    # --- Map mode is not ready for the demo: degrade to a chart, say so ---
+    # Map mode is decided by the intent rules (explicit map / "where" cue only).
     map_requested = state["output_mode"] == "map"
-    if map_requested:
-        state["output_mode"] = "dashboard"
-        state["viz_types"] = [v for v in state.get("viz_types", []) if v != "map"] or ["bar"]
+    map_payload: dict | None = None
+    map_note = ""
 
     # --- Clarification gate ---
     if state["clarification_needed"]:
@@ -398,9 +398,28 @@ async def run_agent_stream(
             yield sse("done")
             return
 
+    # --- Map: values per area joined to DHIS2 geometry; honest fallback ---
+    if map_requested and state["output_mode"] == "map":
+        _t_map = time.monotonic()
+        try:
+            map_payload = await build_map(state, settings)
+        except MapUnavailable as exc:
+            map_note = f"I couldn't draw a map: {exc}. Showing a chart instead."
+        except Exception as exc:  # never let the map break the answer
+            logger.error("map_build_failed", extra={"error": str(exc)[:300]}, exc_info=True)
+            map_note = "I couldn't draw a map because of an unexpected error. Showing a chart instead."
+        finally:
+            _NODE_TIMES.append(("build_map", round(time.monotonic() - _t_map, 2)))
+        if map_payload is None:
+            state["output_mode"] = "dashboard"
+            state["viz_types"] = [v for v in state.get("viz_types", []) if v != "map"] or ["bar"]
+
     # --- Content generation + routing ---
     try:
-        state = await _timed_node("generate_content", generate_content, state, settings)
+        if map_payload is not None:
+            pass  # the map payload is the content
+        else:
+            state = await _timed_node("generate_content", generate_content, state, settings)
     except Exception as exc:
         logger.error("content_generation_failed", extra={"error": str(exc)})
         yield sse("error", {"code": "CONTENT_FAILED", "user_message": "Content generation failed.", "detail": str(exc)})
@@ -416,12 +435,18 @@ async def run_agent_stream(
     data_used = _data_used_text(state) if state["requires_data"] else ""
     if data_used and mode != "conversational":
         yield sse("token", {"text": data_used + "\n\n"})
-    if map_requested:
-        yield sse("token", {"text": "Map view is coming soon — showing a chart instead.\n\n"})
+    if map_note:
+        yield sse("token", {"text": map_note + "\n\n"})
     if cached_label and mode != "conversational":
         yield sse("token", {"text": f"⚠️ {cached_label} (DHIS2 demo snapshot — the live server is unreachable).\n\n"})
 
-    if mode == "dashboard":
+    if map_payload is not None:
+        summary = _map_summary(map_payload)
+        if summary:
+            yield sse("token", {"text": summary + "\n\n"})
+        map_payload["export"] = export_payload_from_map(map_payload)
+        yield sse("map_config", map_payload)
+    elif mode == "dashboard":
         charts = state["active_chart_configs"]
         if charts:
             for chart in charts:
@@ -480,6 +505,35 @@ async def run_agent_stream(
     )
     yield _timings_event(pipeline_start, _nodes, _llm_calls)
     yield sse("done")
+
+
+def _map_summary(payload: dict) -> str:
+    """One deterministic line: highest / lowest area and how many are drawn."""
+    from backend.app.agent.map_builder import fmt_value
+
+    rows = [r for r in (payload.get("table") or {}).get("rows") or [] if r[1] is not None]
+    if not rows:
+        return ""
+    unit = payload.get("unit") or ""
+    level = (payload.get("level_name") or "area").lower()
+    hi, lo = rows[0], rows[-1]
+    drawn = len((payload.get("geojson") or {}).get("features") or []) + len(payload.get("points") or [])
+    line = f"**Highest:** {hi[0]} ({fmt_value(float(hi[1]), unit)})"
+    if len(rows) > 1:
+        line += f" · **Lowest:** {lo[0]} ({fmt_value(float(lo[1]), unit)})"
+    line += f" · {drawn} {_plural_word(level, drawn)} on the map"
+    notes = payload.get("notes") or []
+    if notes:
+        line += "\n\n" + "\n".join(f"_{n}_" for n in notes)
+    return line
+
+
+def _plural_word(word: str, n: int) -> str:
+    if n == 1:
+        return word
+    if word.endswith("y") and not word.endswith(("ay", "ey", "oy")):
+        return word[:-1] + "ies"
+    return word + "s"
 
 
 def _data_source_event(tracker: dict, settings: Settings) -> dict | None:

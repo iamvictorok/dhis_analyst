@@ -1048,3 +1048,26 @@ button:disabled {
   flex-wrap: nowrap; overflow-x: auto; justify-content: flex-start; padding-bottom: 4px;
 }
 .suggest-chips-bar .suggest-chip { flex: 0 0 auto; }
+
+/* --- Map view --------------------------------------------------------- */
+.map-view { margin-top: 8px; }
+.map-container {
+  width: 100%;
+  min-height: 560px;
+  border-radius: 8px;
+  overflow: hidden;
+  background: #ffffff;
+  border: 1px solid var(--border-color);
+}
+.map-actions { display: flex; gap: 8px; align-items: center; margin: 8px 0; flex-wrap: wrap; }
+.map-table-wrapper {
+  max-height: 280px;
+  overflow: auto;
+  border: 1px solid var(--border-color);
+  border-radius: 6px;
+  background: var(--bg-primary);
+}
+.map-table { width: 100%; border-collapse: collapse; font-size: 0.95rem; }
+.map-table th, .map-table td { padding: 6px 12px; border-bottom: 1px solid var(--border-color); text-align: left; }
+.map-table th { position: sticky; top: 0; background: var(--bg-secondary); font-weight: 600; }
+.map-table td.num { text-align: right; font-variant-numeric: tabular-nums; }

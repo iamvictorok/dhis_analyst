@@ -331,7 +331,7 @@ def test_live_answers_have_no_cached_label(tmp_path, monkeypatch):
     assert "Cached data as of" not in body
 
 
-def test_map_mode_degrades_to_chart_with_notice(tmp_path, monkeypatch):
+def test_map_that_cannot_be_drawn_falls_back_to_chart_with_honest_note(tmp_path, monkeypatch):
     from backend.app.agent import graph
     from backend.app.models import ChatRequest
 
@@ -350,8 +350,12 @@ def test_map_mode_degrades_to_chart_with_notice(tmp_path, monkeypatch):
     body = "".join(_collect(graph.run_agent_stream(
         ChatRequest(message="Show me a map of ANC 1 Coverage by district in Sierra Leone for 2025"), s,
     )))
-    assert "Map view is coming soon" in body
+    # The fake resolver gives no sub-unit breakdown, so there is nothing to map:
+    # the user asked for a map, so they get a chart plus the real reason.
+    assert "I couldn't draw a map" in body
+    assert "coming soon" not in body
     assert "event: chart_config" in body
+    assert "event: map_config" not in body
     assert 'id=\\"map\\"' not in body
 
 

@@ -21,6 +21,7 @@ import { detectDhis2 } from './auth/dhis2Auth.js';
 import { readSseStream } from './lib/stream.js';
 import { sanitizeHtml } from './lib/sanitize.js';
 import Dashboard from './components/Dashboard.jsx';
+import MapView from './components/MapView.jsx';
 import ReportEditor from './components/ReportEditor.jsx';
 import DownloadBar from './components/DownloadBar.jsx';
 import CopyButton from './components/CopyButton.jsx';
@@ -167,7 +168,7 @@ function App() {
   const dhis2Status = useDhis2Status(authed);
 
   // Artefacts accumulated during current stream (for the active assistant msg)
-  const streamArtefacts = useRef({ charts: [], reportHtml: '', slides: [], evidence: [], exportData: null, dataSource: null });
+  const streamArtefacts = useRef({ charts: [], maps: [], reportHtml: '', slides: [], evidence: [], exportData: null, dataSource: null });
 
   // Sidebar state
   const [sidebarOpen, setSidebarOpen] = useState(false);
@@ -226,7 +227,7 @@ function App() {
       setActiveConvId(conv.id);
       setMessages([]);
       setClarification(null);
-      streamArtefacts.current = { charts: [], reportHtml: '', slides: [], evidence: [], exportData: null, dataSource: null };
+      streamArtefacts.current = { charts: [], maps: [], reportHtml: '', slides: [], evidence: [], exportData: null, dataSource: null };
       setSidebarOpen(false);
     } catch (err) {
       console.error('Failed to create conversation:', err);
@@ -241,7 +242,7 @@ function App() {
     abortRef.current?.abort();
     setActiveConvId(id);
     setClarification(null);
-    streamArtefacts.current = { charts: [], reportHtml: '', slides: [], evidence: [], exportData: null, dataSource: null };
+    streamArtefacts.current = { charts: [], maps: [], reportHtml: '', slides: [], evidence: [], exportData: null, dataSource: null };
     setSidebarOpen(false);
     try {
       const msgs = await apiGet(`/api/conversations/${id}/messages`);
@@ -283,7 +284,7 @@ function App() {
     abortRef.current = controller;
 
     // Reset stream artefacts
-    streamArtefacts.current = { charts: [], reportHtml: '', slides: [], evidence: [], exportData: null, dataSource: null };
+    streamArtefacts.current = { charts: [], maps: [], reportHtml: '', slides: [], evidence: [], exportData: null, dataSource: null };
 
     // Ensure we have an active conversation
     let convId = activeConvId;
@@ -361,6 +362,23 @@ function App() {
               data,
             ];
             // Update last assistant message artefacts in UI
+            setMessages(prev => {
+              const updated = [...prev];
+              const last = updated[updated.length - 1];
+              if (last?.role === 'assistant') {
+                updated[updated.length - 1] = {
+                  ...last,
+                  artefacts: { ...streamArtefacts.current },
+                };
+              }
+              return updated;
+            });
+            break;
+          case 'map_config':
+            streamArtefacts.current.maps = [
+              ...(streamArtefacts.current.maps || []).filter(m => m.id !== data.id),
+              data,
+            ];
             setMessages(prev => {
               const updated = [...prev];
               const last = updated[updated.length - 1];
@@ -495,7 +513,7 @@ function App() {
         setMessages(prev => {
           const last = prev[prev.length - 1];
           const a = streamArtefacts.current;
-          const hasArtefacts = a.charts.length || a.reportHtml || a.slides.length || a.evidence.length || a.exportData;
+          const hasArtefacts = a.charts.length || (a.maps || []).length || a.reportHtml || a.slides.length || a.evidence.length || a.exportData;
           if (last?.role === 'assistant' && (last.content || hasArtefacts)) {
             apiPost(`/api/conversations/${convId}/messages`, {
               role: 'assistant',
@@ -640,6 +658,7 @@ function MessageBlock({ msg, isLast, isLoading }) {
   const isUser = msg.role === 'user';
   const art = msg.artefacts;
   const hasCharts = art?.charts?.length > 0;
+  const hasMaps = art?.maps?.length > 0;
   const hasReport = !!art?.reportHtml;
   const hasEvidence = art?.evidence?.length > 0;
   const hasSlides = art?.slides?.length > 0;
@@ -675,8 +694,26 @@ function MessageBlock({ msg, isLast, isLoading }) {
       </div>
 
       {/* Inline artefacts — only for assistant messages */}
-      {!isUser && (hasCharts || hasReport || hasEvidence || hasSlides || hasExport) && (
+      {!isUser && (hasCharts || hasMaps || hasReport || hasEvidence || hasSlides || hasExport) && (
         <div class="message-artefacts">
+          {hasMaps && (
+            <div class="artefact-section">
+              <div class="artefact-section-head" style="display: flex; align-items: center; justify-content: space-between; width: 100%;">
+                <div style="display: flex; align-items: center; gap: 8px;">
+                  <h3>🗺️ Map</h3>
+                  <span class="badge">{art.maps[0].level_name || 'Areas'}</span>
+                </div>
+                <div class="artefact-actions">
+                  <CopyButton
+                    text={[(art.maps[0].table?.headers || []).join('\t'), ...(art.maps[0].table?.rows || []).map(r => r.join('\t'))].join('\n')}
+                    label="Copy table"
+                  />
+                </div>
+              </div>
+              {art.maps.map(m => <MapView key={m.id} map={m} />)}
+            </div>
+          )}
+
           {hasCharts && (
             <div class="artefact-section">
               <div class="artefact-section-head" style="display: flex; align-items: center; justify-content: space-between; width: 100%;">
@@ -859,7 +896,7 @@ function Composer({ loading, mode, onModeChange, onSend }) {
           <option value="report">Report</option>
           <option value="presentation">Slides</option>
           <option value="export">Export</option>
-          <option value="map" disabled>Map (coming soon)</option>
+          <option value="map">Map</option>
         </select>
         <textarea
           ref={textareaRef}
