@@ -992,6 +992,13 @@ def _context_messages(state: AgentState) -> list[str]:
     return out
 
 
+_SPATIAL_CUE_RE = re.compile(
+    r"\b(where|which|geograph\w*|spatial\w*|distribution|map|maps|sub[- ]?nationa\w*|breakdown|broken\s+down|"
+    r"by\s+(?:area|place|location|region|unit)s?|each|every|across|per)\b",
+    re.I,
+)
+
+
 async def _apply_breakdown_level(state: AgentState, settings: Settings) -> None:
     from backend.app.agent.resolution import org_levels, parse_breakdown_level, level_name, _plural as _p
 
@@ -1010,7 +1017,16 @@ async def _apply_breakdown_level(state: AgentState, settings: Settings) -> None:
         org_level = 1
         org["level"] = 1
     disaggs = list(state.get("disaggregations") or [])
-    wanted = parse_breakdown_level(_last_user_text(state), levels)
+    user_text = _last_user_text(state)
+    wanted = parse_breakdown_level(user_text, levels)
+    if (wanted is None and "ou_children" in disaggs and levels
+            and not _context_messages(state)
+            and state.get("output_mode") != "map"
+            and not _SPATIAL_CUE_RE.search(user_text)):
+        # The parser added a sub-unit breakdown that nothing in a fresh
+        # question asks for ("Monthly trend of X in Sierra Leone"): answer for
+        # the place itself. Follow-ups keep it (it may carry over), as do maps.
+        disaggs = [d for d in disaggs if d != "ou_children"]
     if wanted is None and "ou_children" in disaggs:
         wanted = org_level + 1
     if wanted is not None and wanted > org_level:

@@ -188,3 +188,39 @@ def test_british_spelling_matches_american_names():
 
 def test_named_year_wins_over_lost_parser_period():
     assert expand_periods("Monthly Penta 3 coverage for Bo in 2025", ["THIS_YEAR"], TODAY) == MONTHS_2025
+
+
+# --- parser-added district breakdown on a fresh question -------------------
+
+LEVELS = [{"level": 1, "name": "National"}, {"level": 2, "name": "District"},
+          {"level": 3, "name": "Chiefdom"}, {"level": 4, "name": "Facility"}]
+
+
+def _bd_state(text, history=None, mode="dashboard"):
+    msgs = list(history or []) + [{"role": "user", "content": text}]
+    return {"messages": msgs, "org_unit": {"label": "Sierra Leone", "uid": "ImspTQPwCqd", "level": 1},
+            "disaggregations": ["ou_children"], "output_mode": mode}
+
+
+@pytest.mark.parametrize("text,history,mode,kept", [
+    ("Monthly trend of inpatient malaria cases in Sierra Leone for 2025", None, "dashboard", False),
+    ("Malaria cases by district in 2025", None, "dashboard", True),
+    ("Where were malaria cases highest in 2025?", None, "dashboard", True),
+    ("Malaria cases in 2025", None, "map", True),
+    ("Same for 2024", [{"role": "user", "content": "Malaria cases by district 2025"},
+                       {"role": "assistant", "content": "..."}], "dashboard", True),
+])
+def test_parser_breakdown_dropped_only_without_any_cue(monkeypatch, text, history, mode, kept):
+    import asyncio
+
+    from backend.app.agent import resolution
+    from backend.app.agent.nodes import metadata_resolve as M
+
+    async def fake_levels(settings, token=None):
+        return LEVELS
+
+    monkeypatch.setattr(resolution, "org_levels", fake_levels)
+    st = _bd_state(text, history, mode)
+    asyncio.run(M._apply_breakdown_level(st, None))
+    assert ("ou_children" in st["disaggregations"]) is kept
+    assert (st["org_unit"].get("breakdown_level") == 2) is kept
