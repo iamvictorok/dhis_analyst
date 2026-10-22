@@ -1,0 +1,55 @@
+# Render Blueprint — one free web service (Docker): builds the frontend and
+# serves it from the FastAPI backend. Secrets marked `sync: false` are entered
+# in the Render dashboard when the Blueprint is created; never commit them.
+services:
+  - type: web
+    name: dhis2-ai-analyst
+    runtime: docker
+    plan: free
+    region: frankfurt
+    branch: main
+    dockerfilePath: ./Dockerfile
+    dockerContext: .
+    healthCheckPath: /health
+    autoDeploy: true
+    envVars:
+      # --- App / auth ---
+      - key: DEPLOYMENT_MODE
+        value: standalone
+      - key: STANDALONE_ACCESS_CODE      # required: login only accepts this code
+        sync: false
+      - key: REQUIRE_ACCESS_CODE         # refuse to boot without the code
+        value: "true"
+      - key: JWT_SECRET
+        generateValue: true
+      - key: JWT_EXPIRE_SECONDS          # 12 h, so a demo session never expires mid-demo
+        value: "43200"
+      - key: TRUST_PROXY_HEADERS         # client IPs via Render's proxy (rate limiting)
+        value: "true"
+      # --- LLM ---
+      - key: LLM_PROVIDER
+        value: gemini
+      - key: LLM_MODEL
+        value: gemini/gemini-flash-latest
+      - key: LLM_API_KEY
+        sync: false
+      - key: LLM_TIMEOUT_SECONDS
+        value: "90"
+      - key: EMBEDDING_PROVIDER
+        value: mock
+      # --- DHIS2 (public demo instances) ---
+      - key: DHIS2_BASE_URL
+        value: https://play.im.dhis2.org/stable-2-41-10
+      - key: DHIS2_BASE_URLS
+        value: https://play.im.dhis2.org/stable-2-41-10,https://play.im.dhis2.org/stable-2-40-12,https://play.im.dhis2.org/stable-2-42-7
+      - key: DHIS2_SERVICE_ACCOUNT_USER
+        value: admin
+      - key: DHIS2_SERVICE_ACCOUNT_PASS  # public demo password "district"
+        sync: false
+      - key: DHIS2_SNAPSHOT_MODE
+        value: auto
+      # --- Storage (free plan disk is ephemeral; metadata re-syncs on boot) ---
+      - key: DATABASE_URL
+        value: sqlite+aiosqlite:////tmp/dhis2_analyst.db
+      - key: TEMP_FILE_DIR
+        value: /tmp/dhis2_analyst

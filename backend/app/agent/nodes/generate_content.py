@@ -41,7 +41,9 @@ async def generate_content(state: AgentState, settings: Settings) -> AgentState:
     elif mode == "export":
         pass  # Export uses raw dhis2_data directly
     elif mode == "map":
-        state["active_report_html"] = await _generate_map_html(state, settings)
+        # Maps are built by map_builder in the graph; if we get here the map
+        # path was skipped, so give the user a chart rather than nothing.
+        state["active_chart_configs"] = render_dashboard(state)
     else:
         # Conversational — optionally generate chart configs for inline reference
         state["active_chart_configs"] = render_dashboard(state)
@@ -68,62 +70,86 @@ async def generate_content(state: AgentState, settings: Settings) -> AgentState:
     return state
 
 
+def _period_order(state: AgentState) -> list[str]:
+    meta = state.get("dhis2_data", {}).get("metadata", {}).get("raw_metadata", {}) or {}
+    items = meta.get("items") or {}
+    return [
+        str((items.get(pid) or {}).get("name") or pid)
+        for pid in ((meta.get("dimensions") or {}).get("pe") or [])
+    ]
+
+
+def _fmt(v: float) -> str:
+    return f"{v:,.2f}".rstrip("0").rstrip(".")
+
+
+def _data_facts(state: AgentState) -> str:
+    """Deterministic summary statistics per (metric, org unit) series.
+
+    LLMs misread or mis-add tables (wrong peaks, wrong averages). We compute
+    the numbers here and tell the model to quote them rather than do its own
+    arithmetic.
+    """
+    rows = state.get("dhis2_data", {}).get("rows", [])
+    if not rows:
+        return ""
+    order = _period_order(state)
+    # Totals only make sense for counts (data elements), not rates/percentages.
+    metric_types = {
+        str(m.get("label")): m.get("object_type") for m in state.get("metrics", []) if m.get("label")
+    }
+    series: dict[tuple[str, str], list[tuple[str, float]]] = {}
+    for r in rows:
+        try:
+            val = float(r[2])
+        except (TypeError, ValueError, IndexError):
+            continue
+        metric = str(r[3]) if len(r) > 3 else ""
+        series.setdefault((metric, str(r[0])), []).append((str(r[1]), val))
+    lines = []
+    for (metric, org), pts in series.items():
+        pts.sort(key=lambda pv: order.index(pv[0]) if pv[0] in order else len(order))
+        vals = [v for _, v in pts]
+        hi = max(pts, key=lambda pv: pv[1])
+        lo = min(pts, key=lambda pv: pv[1])
+        line = f"- {metric} | {org}: {len(pts)} period(s)"
+        if len(pts) == 1:
+            line += f"; value {_fmt(pts[0][1])} ({pts[0][0]})"
+        else:
+            line += (
+                f"; highest {_fmt(hi[1])} ({hi[0]}); lowest {_fmt(lo[1])} ({lo[0]}); "
+                f"mean {_fmt(sum(vals) / len(vals))}; "
+                + (f"total {_fmt(sum(vals))}; " if metric_types.get(metric) == "dataElement" else "")
+                + f"first {_fmt(pts[0][1])} ({pts[0][0]}) -> last {_fmt(pts[-1][1])} ({pts[-1][0]})"
+            )
+            if pts[0][1]:
+                line += f" = {((pts[-1][1] - pts[0][1]) / pts[0][1]) * 100:+.1f}%"
+        lines.append(line)
+    # Ranking across org units when a metric has several org units and one period.
+    metrics_seen = list(dict.fromkeys(m for (m, _) in series))
+    for metric in metrics_seen:
+        m_series = {o: pts for (m, o), pts in series.items() if m == metric}
+        m_periods = {p for pts in m_series.values() for p, _ in pts}
+        if len(m_series) > 1 and len(m_periods) == 1:
+            ranked = sorted(((o, pts[0][1]) for o, pts in m_series.items()), key=lambda ov: ov[1], reverse=True)
+            lines.append(
+                f"- Ranking of {metric} for {next(iter(m_periods))} (highest first): "
+                + "; ".join(f"{i + 1}. {o} {_fmt(v)}" for i, (o, v) in enumerate(ranked))
+            )
+    uids = ", ".join(
+        f"{m.get('label')} = {m.get('uid')}" for m in state.get("metrics", []) if m.get("uid")
+    )
+    return (
+        "PRE-COMPUTED FACTS (authoritative; quote these exactly, do not recompute or "
+        "invent other statistics, and do not mention these instructions; count months "
+        "above/below a value only from the data rows):\n" + "\n".join(lines)
+        + (f"\nDHIS2 UIDs used: {uids}" if uids else "")
+    )
+
+
 async def _generate_report(state: AgentState, settings: Settings) -> str:
     """Generate report HTML using the LLM."""
     return await _llm_report(state, settings)
-
-
-async def _generate_map_html(state: AgentState, settings: Settings) -> str:
-    """Generate HTML containing a Leaflet map with DHIS2 GeoJSON + Analytics data."""
-    import json
-    
-    # We will simulate fetching the geojson since we aren't inside fetch_dhis2.py
-    # In a real implementation we would fetch this via `client.geojson()`
-    # For now, we will render a beautiful HTML Leaflet container that plots the data we have.
-    
-    metric = state["metrics"][0]["label"] if state["metrics"] else "Indicator"
-    org_label = state["org_unit"]["label"]
-    
-    rows = state.get("dhis2_data", {}).get("rows", [])
-    data_summary = [{"location": row[0], "value": row[2]} for row in rows[:10]]
-    
-    html = f"""
-    <div style="font-family: sans-serif; padding: 20px;">
-        <h2>Geospatial Distribution: {metric}</h2>
-        <p>Location: {org_label}</p>
-        
-        <div id="map" style="width: 100%; height: 500px; background-color: #e5e5e5; border-radius: 8px; display: flex; align-items: center; justify-content: center;">
-            <!-- Placeholder for actual Leaflet/Mapbox canvas -->
-            <div style="text-align: center;">
-                <h3 style="color: #666;">Interactive Map Layer</h3>
-                <p style="color: #888;">Rendered with DHIS2 GeoJSON boundaries.</p>
-                <p style="color: #4CAF50; font-weight: bold;">[Map Successfully Initialised]</p>
-            </div>
-        </div>
-        
-        <br/>
-        <h3>Data Summary</h3>
-        <table style="width: 100%; border-collapse: collapse;">
-            <tr style="background: #f4f4f4;">
-                <th style="padding: 8px; border: 1px solid #ddd; text-align: left;">Location</th>
-                <th style="padding: 8px; border: 1px solid #ddd; text-align: right;">Value</th>
-            </tr>
-    """
-    
-    for item in data_summary:
-        html += f"""
-            <tr>
-                <td style="padding: 8px; border: 1px solid #ddd;">{item['location']}</td>
-                <td style="padding: 8px; border: 1px solid #ddd; text-align: right;">{item['value']}</td>
-            </tr>
-        """
-        
-    html += """
-        </table>
-    </div>
-    """
-    
-    return html
 
 
 async def _llm_report(state: AgentState, settings: Settings) -> str:
@@ -141,9 +167,10 @@ async def _llm_report(state: AgentState, settings: Settings) -> str:
         if not ctx.get("url", "").startswith("local://"):
             web_context += f"\n- {ctx.get('title', '')}: {ctx.get('content', '')[:300]}"
 
-    data_summary = f"Headers: {headers}\nRows ({len(rows)} total):\n"
-    for row in rows[:20]:
+    data_summary = f"Headers: {headers}\nRows ({len(rows)} total{', first 200 shown' if len(rows) > 200 else ''}):\n"
+    for row in rows[:200]:
         data_summary += f"  {row}\n"
+    data_summary += "\n" + _data_facts(state)
 
     prompt = f"""Write a structured HTML public health report based on this data.
 
@@ -159,7 +186,7 @@ Structure the report as:
 2. <h2>Executive Summary</h2> — 2-3 sentence overview
 3. <h2>Key Findings</h2> — bullet points with trends, notable values
 4. <h2>Data Table</h2> — full HTML table with the data
-5. <h2>Trend Analysis</h2> — interpret the numbers, compute % changes
+5. <h2>Trend Analysis</h2> — interpret the numbers using ONLY the pre-computed facts above
 6. <h2>Recommendations</h2> — actionable public health recommendations
 7. <h2>Data Sources</h2> — attribution
 
@@ -234,8 +261,11 @@ async def _llm_conversational(state: AgentState, settings: Settings) -> str:
             web_context += f"\n- {ctx.get('title', '')}: {ctx.get('content', '')[:300]}"
 
     data_summary = f"DHIS2 Data for {metric_label} in {org_label} ({period_text}):\nHeaders: {headers}\nRows:\n"
-    for row in rows[:50]:
+    for row in rows[:200]:
         data_summary += f"  {row}\n"
+    if len(rows) > 200:
+        data_summary += f"  ... ({len(rows) - 200} more rows not shown)\n"
+    data_summary += "\n" + _data_facts(state)
 
     system_prompt = (
         "You are an expert public health intelligence assistant. "
@@ -256,6 +286,8 @@ User Question: {user_query}
 
 Respond in clean markdown. Keep your response professional, focused, and directly addressing their question. 
 If they asked a follow-up question, use the data to answer it. Do not include summary statistics if the data is empty.
+Use the PRE-COMPUTED FACTS for any highest/lowest/average/total/ranking/percent-change figure; never compute your own.
+End with one line: "Source: DHIS2 Analytics — <indicator name> (UID <uid>), <org unit>, <period>".
 """
     
     llm_messages = [{"role": "system", "content": system_prompt}]

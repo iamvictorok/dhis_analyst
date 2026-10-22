@@ -20,11 +20,18 @@ from docx.shared import Inches, Pt, Cm, RGBColor
 from docx.enum.section import WD_ORIENT
 from docx.enum.text import WD_ALIGN_PARAGRAPH
 
+from backend.app.generators.html_sanitize import sanitize_report_html
+
 logger = logging.getLogger("dhis2_analyst.docx_gen")
 
 
 def html_to_docx(html: str, title: str = "DHIS2 Analyst Report") -> bytes:
-    """Convert report HTML to a styled DOCX document."""
+    """Convert report HTML to a styled DOCX document.
+
+    The HTML may be the user's edited report from the browser; it is sanitised
+    first (script/style/etc. dropped with their content).
+    """
+    html = sanitize_report_html(html)
     soup = BeautifulSoup(html, "html.parser")
     node_count = len(soup.find_all(["h1", "h2", "h3", "h4", "p", "ul", "ol", "table"], recursive=True))
     logger.info("docx_generate_start", extra={"title_len": len(title), "html_len": len(html), "node_count": node_count})

@@ -1009,3 +1009,65 @@ button:disabled {
     padding: 8px 12px 12px;
   }
 }
+
+/* ---- DHIS2 source status (live / fallback / cached) ---- */
+.status-pill {
+  display: inline-flex; align-items: center; gap: 6px;
+  font-size: 0.75rem; padding: 3px 10px; border-radius: 999px;
+  border: 1px solid var(--border); color: var(--text-muted); margin-right: 8px;
+  white-space: nowrap;
+}
+.status-dot { width: 8px; height: 8px; border-radius: 50%; background: var(--text-muted); }
+.status-live .status-dot { background: var(--success); box-shadow: 0 0 6px var(--success); }
+.status-fallback .status-dot { background: var(--warning); }
+.status-cached .status-dot { background: #fb923c; }
+.status-down .status-dot { background: var(--danger); }
+.status-live { color: var(--success); }
+.status-fallback { color: var(--warning); }
+.status-cached { color: #fb923c; }
+.status-down { color: var(--danger); }
+.source-badge {
+  display: inline-block; font-size: 0.75rem; margin: 2px 0 6px;
+  padding: 2px 8px; border-radius: 6px; border: 1px solid currentColor;
+}
+.cached-banner { padding: 8px 12px; border-left: 4px solid #fb923c; background: rgba(251,146,60,0.12); }
+
+/* ---- Suggested-question chips ---- */
+.suggest-chips { display: flex; flex-wrap: wrap; gap: 8px; justify-content: center; margin-top: 12px; }
+.suggest-chip {
+  font: inherit; font-size: 0.8rem; cursor: pointer;
+  padding: 6px 12px; border-radius: 999px;
+  border: 1px solid var(--border); background: var(--accent-dim); color: var(--accent);
+  transition: border-color 0.15s, background 0.15s;
+}
+.suggest-chip:hover:not(:disabled) { border-color: var(--accent); }
+.suggest-chip:disabled { opacity: 0.5; cursor: not-allowed; }
+.suggest-chips-bar { display: flex; justify-content: center; padding: 4px 16px 0; }
+.suggest-chips-bar .suggest-chips {
+  max-width: var(--thread-max); width: 100%; margin-top: 0;
+  flex-wrap: nowrap; overflow-x: auto; justify-content: flex-start; padding-bottom: 4px;
+}
+.suggest-chips-bar .suggest-chip { flex: 0 0 auto; }
+
+/* --- Map view --------------------------------------------------------- */
+.map-view { margin-top: 8px; }
+.map-container {
+  width: 100%;
+  min-height: 560px;
+  border-radius: 8px;
+  overflow: hidden;
+  background: #ffffff;
+  border: 1px solid var(--border-color);
+}
+.map-actions { display: flex; gap: 8px; align-items: center; margin: 8px 0; flex-wrap: wrap; }
+.map-table-wrapper {
+  max-height: 280px;
+  overflow: auto;
+  border: 1px solid var(--border-color);
+  border-radius: 6px;
+  background: var(--bg-primary);
+}
+.map-table { width: 100%; border-collapse: collapse; font-size: 0.95rem; }
+.map-table th, .map-table td { padding: 6px 12px; border-bottom: 1px solid var(--border-color); text-align: left; }
+.map-table th { position: sticky; top: 0; background: var(--bg-secondary); font-weight: 600; }
+.map-table td.num { text-align: right; font-variant-numeric: tabular-nums; }

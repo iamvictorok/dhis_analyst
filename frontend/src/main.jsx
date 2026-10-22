@@ -21,7 +21,9 @@ import { detectDhis2 } from './auth/dhis2Auth.js';
 import { readSseStream } from './lib/stream.js';
 import { sanitizeHtml } from './lib/sanitize.js';
 import Dashboard from './components/Dashboard.jsx';
+import MapView from './components/MapView.jsx';
 import ReportEditor from './components/ReportEditor.jsx';
+import { reportHtmlForExport } from './lib/reportExport.js';
 import DownloadBar from './components/DownloadBar.jsx';
 import CopyButton from './components/CopyButton.jsx';
 import EvidenceTag from './components/EvidenceTag.jsx';
@@ -83,6 +85,70 @@ async function apiPatch(path, body) {
 }
 
 // ---------------------------------------------------------------------------
+// Suggested demo questions (chips). The backend list (/api/demo/questions) wins;
+// this copy only covers an older backend. Chips SEND the question through the
+// normal pipeline — nothing is pre-answered.
+// ---------------------------------------------------------------------------
+
+const DEFAULT_DEMO_QUESTIONS = [
+  { id: 'anc1', label: 'ANC 1 Coverage · Sierra Leone · 12 months', question: 'Show me ANC 1 Coverage in Sierra Leone for the last 12 months', output_mode: 'dashboard' },
+  { id: 'penta3', label: 'Penta 3 coverage <1y by district · 2025', question: 'Show Penta 3 coverage <1y for each district in Sierra Leone for 2025', output_mode: 'dashboard' },
+  { id: 'idsr', label: 'IDSR Malaria trend · 12 months', question: 'Show me the trend of IDSR Malaria in Sierra Leone for the last 12 months', output_mode: 'dashboard' },
+  { id: 'report', label: 'Programme review report · ANC 1', question: 'Write a programme review report on ANC 1 Coverage in Sierra Leone for the last 12 months', output_mode: 'report' },
+  { id: 'export', label: 'Export ANC 1 by district to Excel', question: 'Export ANC 1 Coverage by district for the last 12 months to Excel', output_mode: 'export' },
+];
+
+const STATUS_TEXT = { live: 'Live', fallback: 'Fallback', cached: 'Cached', down: 'Offline', unknown: 'Checking' };
+
+function useDhis2Status(enabled) {
+  const [status, setStatus] = useState(null);
+  useEffect(() => {
+    if (!enabled) return undefined;
+    let stopped = false;
+    const load = () => fetch('/api/dhis2/status')
+      .then(r => (r.ok ? r.json() : null))
+      .then(d => { if (!stopped && d) setStatus(d); })
+      .catch(() => { if (!stopped) setStatus({ mode: 'unknown', label: 'Status unavailable' }); });
+    load();
+    const t = setInterval(load, 30000);
+    return () => { stopped = true; clearInterval(t); };
+  }, [enabled]);
+  return status;
+}
+
+function StatusDot({ status }) {
+  const mode = status?.mode || 'unknown';
+  const title = status?.label || 'Checking DHIS2…';
+  return (
+    <span class={`status-pill status-${mode}`} title={title} aria-label={`DHIS2 data source: ${title}`}>
+      <span class="status-dot" />
+      {STATUS_TEXT[mode] || mode}
+    </span>
+  );
+}
+
+function SuggestedChips({ questions, disabled, onPick }) {
+  if (!questions?.length) return null;
+  return (
+    <div class="suggest-chips" role="list" aria-label="Suggested questions">
+      {questions.map(q => (
+        <button
+          key={q.id}
+          type="button"
+          role="listitem"
+          class="suggest-chip"
+          disabled={disabled}
+          title={q.question}
+          onClick={() => onPick(q)}
+        >
+          {q.label || q.question}
+        </button>
+      ))}
+    </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
 // App
 // ---------------------------------------------------------------------------
 
@@ -99,9 +165,11 @@ function App() {
   const [loading, setLoading] = useState(false);
   const [mode, setMode] = useState('');
   const [clarification, setClarification] = useState(null);
+  const [demoQuestions, setDemoQuestions] = useState(DEFAULT_DEMO_QUESTIONS);
+  const dhis2Status = useDhis2Status(authed);
 
   // Artefacts accumulated during current stream (for the active assistant msg)
-  const streamArtefacts = useRef({ charts: [], reportHtml: '', slides: [], evidence: [], exportData: null });
+  const streamArtefacts = useRef({ charts: [], maps: [], reportHtml: '', slides: [], evidence: [], exportData: null, dataSource: null });
 
   // Sidebar state
   const [sidebarOpen, setSidebarOpen] = useState(false);
@@ -122,6 +190,9 @@ function App() {
       apiGet('/api/conversations')
         .then(setConversations)
         .catch(() => setConversations([]));
+      apiGet('/api/demo/questions')
+        .then(qs => { if (Array.isArray(qs) && qs.length) setDemoQuestions(qs); })
+        .catch(() => {});
     }
   }, [authed]);
 
@@ -157,7 +228,7 @@ function App() {
       setActiveConvId(conv.id);
       setMessages([]);
       setClarification(null);
-      streamArtefacts.current = { charts: [], reportHtml: '', slides: [], evidence: [], exportData: null };
+      streamArtefacts.current = { charts: [], maps: [], reportHtml: '', slides: [], evidence: [], exportData: null, dataSource: null };
       setSidebarOpen(false);
     } catch (err) {
       console.error('Failed to create conversation:', err);
@@ -172,7 +243,7 @@ function App() {
     abortRef.current?.abort();
     setActiveConvId(id);
     setClarification(null);
-    streamArtefacts.current = { charts: [], reportHtml: '', slides: [], evidence: [], exportData: null };
+    streamArtefacts.current = { charts: [], maps: [], reportHtml: '', slides: [], evidence: [], exportData: null, dataSource: null };
     setSidebarOpen(false);
     try {
       const msgs = await apiGet(`/api/conversations/${id}/messages`);
@@ -202,8 +273,9 @@ function App() {
   // Send message
   // ---------------------------------------------------------------------------
 
-  const handleSend = useCallback(async (text) => {
+  const handleSend = useCallback(async (text, modeOverride) => {
     if (!text.trim() || loading) return;
+    const outputMode = modeOverride !== undefined ? modeOverride : mode;
     setClarification(null);
     setLoading(true);
 
@@ -213,7 +285,7 @@ function App() {
     abortRef.current = controller;
 
     // Reset stream artefacts
-    streamArtefacts.current = { charts: [], reportHtml: '', slides: [], evidence: [], exportData: null };
+    streamArtefacts.current = { charts: [], maps: [], reportHtml: '', slides: [], evidence: [], exportData: null, dataSource: null };
 
     // Ensure we have an active conversation
     let convId = activeConvId;
@@ -261,7 +333,7 @@ function App() {
         body: JSON.stringify({
           message: text,
           conversation_id: convId,
-          output_mode: mode || null,
+          output_mode: outputMode || null,
           allow_web: true,
         }),
       });
@@ -291,6 +363,23 @@ function App() {
               data,
             ];
             // Update last assistant message artefacts in UI
+            setMessages(prev => {
+              const updated = [...prev];
+              const last = updated[updated.length - 1];
+              if (last?.role === 'assistant') {
+                updated[updated.length - 1] = {
+                  ...last,
+                  artefacts: { ...streamArtefacts.current },
+                };
+              }
+              return updated;
+            });
+            break;
+          case 'map_config':
+            streamArtefacts.current.maps = [
+              ...(streamArtefacts.current.maps || []).filter(m => m.id !== data.id),
+              data,
+            ];
             setMessages(prev => {
               const updated = [...prev];
               const last = updated[updated.length - 1];
@@ -333,6 +422,20 @@ function App() {
             break;
           case 'evidence':
             streamArtefacts.current.evidence = Array.isArray(data) ? data : [];
+            setMessages(prev => {
+              const updated = [...prev];
+              const last = updated[updated.length - 1];
+              if (last?.role === 'assistant') {
+                updated[updated.length - 1] = {
+                  ...last,
+                  artefacts: { ...streamArtefacts.current },
+                };
+              }
+              return updated;
+            });
+            break;
+          case 'data_source':
+            streamArtefacts.current.dataSource = data || null;
             setMessages(prev => {
               const updated = [...prev];
               const last = updated[updated.length - 1];
@@ -411,7 +514,7 @@ function App() {
         setMessages(prev => {
           const last = prev[prev.length - 1];
           const a = streamArtefacts.current;
-          const hasArtefacts = a.charts.length || a.reportHtml || a.slides.length || a.evidence.length || a.exportData;
+          const hasArtefacts = a.charts.length || (a.maps || []).length || a.reportHtml || a.slides.length || a.evidence.length || a.exportData;
           if (last?.role === 'assistant' && (last.content || hasArtefacts)) {
             apiPost(`/api/conversations/${convId}/messages`, {
               role: 'assistant',
@@ -486,6 +589,7 @@ function App() {
             </h1>
           </div>
           <div class="main-header-right">
+            <StatusDot status={dhis2Status} />
             <button class="btn-sm" onClick={handleLogout}>Logout</button>
           </div>
         </header>
@@ -498,15 +602,16 @@ function App() {
                 <p class="thread-welcome-sub">
                   Ask a public health question about your DHIS2 data — trends, comparisons, dashboards, reports, and more.
                 </p>
+                <p class="thread-welcome-sub">Try one of these:</p>
+                <SuggestedChips questions={demoQuestions} disabled={loading} onPick={q => handleSend(q.question, q.output_mode || '')} />
               </div>
             )}
 
             {messages.length === 0 && activeConvId && (
               <div class="thread-welcome">
                 <p class="thread-welcome-title">💡 Ask a public health question</p>
-                <p class="thread-welcome-sub">
-                  Try: "Show me malaria trends in Kaduna over the last quarter"
-                </p>
+                <p class="thread-welcome-sub">Try one of these:</p>
+                <SuggestedChips questions={demoQuestions} disabled={loading} onPick={q => handleSend(q.question, q.output_mode || '')} />
               </div>
             )}
 
@@ -529,6 +634,12 @@ function App() {
           </div>
         )}
 
+        {messages.length > 0 && (
+          <div class="suggest-chips-bar">
+            <SuggestedChips questions={demoQuestions} disabled={loading} onPick={q => handleSend(q.question, q.output_mode || '')} />
+          </div>
+        )}
+
         <Composer
           loading={loading}
           mode={mode}
@@ -548,16 +659,28 @@ function MessageBlock({ msg, isLast, isLoading }) {
   const isUser = msg.role === 'user';
   const art = msg.artefacts;
   const hasCharts = art?.charts?.length > 0;
+  const hasMaps = art?.maps?.length > 0;
   const hasReport = !!art?.reportHtml;
   const hasEvidence = art?.evidence?.length > 0;
   const hasSlides = art?.slides?.length > 0;
   const hasExport = !!art?.exportData;
   const [sourcesOpen, setSourcesOpen] = useState(false);
+  // The user's edited report HTML (null = unedited). Exports use it so edits
+  // made in the report editor reach the PDF/DOCX and "Copy HTML".
+  const [editedReportHtml, setEditedReportHtml] = useState(null);
+  useEffect(() => { setEditedReportHtml(null); }, [art?.reportHtml]);
+  const exportReportHtml = reportHtmlForExport(art?.reportHtml, editedReportHtml);
 
   return (
     <div class={`message ${isUser ? 'message-user' : 'message-assistant'}`}>
       {!isUser && <span class="message-label">Assistant</span>}
       {isUser && <span class="message-label">You</span>}
+
+      {!isUser && art?.dataSource && art.dataSource.mode !== 'live' && (
+        <span class={`source-badge status-${art.dataSource.mode}`} title={art.dataSource.label}>
+          {art.dataSource.mode === 'cached' ? `⚠️ ${art.dataSource.label}` : `↪ ${art.dataSource.label}`}
+        </span>
+      )}
 
       <div class="message-bubble">
         {msg.content ? (
@@ -577,8 +700,26 @@ function MessageBlock({ msg, isLast, isLoading }) {
       </div>
 
       {/* Inline artefacts — only for assistant messages */}
-      {!isUser && (hasCharts || hasReport || hasEvidence || hasSlides || hasExport) && (
+      {!isUser && (hasCharts || hasMaps || hasReport || hasEvidence || hasSlides || hasExport) && (
         <div class="message-artefacts">
+          {hasMaps && (
+            <div class="artefact-section">
+              <div class="artefact-section-head" style="display: flex; align-items: center; justify-content: space-between; width: 100%;">
+                <div style="display: flex; align-items: center; gap: 8px;">
+                  <h3>🗺️ Map</h3>
+                  <span class="badge">{art.maps[0].level_name || 'Areas'}</span>
+                </div>
+                <div class="artefact-actions">
+                  <CopyButton
+                    text={[(art.maps[0].table?.headers || []).join('\t'), ...(art.maps[0].table?.rows || []).map(r => r.join('\t'))].join('\n')}
+                    label="Copy table"
+                  />
+                </div>
+              </div>
+              {art.maps.map(m => <MapView key={m.id} map={m} />)}
+            </div>
+          )}
+
           {hasCharts && (
             <div class="artefact-section">
               <div class="artefact-section-head" style="display: flex; align-items: center; justify-content: space-between; width: 100%;">
@@ -605,11 +746,11 @@ function MessageBlock({ msg, isLast, isLoading }) {
                   <span class="badge">Editable</span>
                 </div>
                 <div class="artefact-actions">
-                  <CopyButton text={art.reportHtml} label="Copy HTML" />
-                  <DownloadBar reportHtml={art.reportHtml} allowedFormats={['DOCX', 'PDF']} />
+                  <CopyButton text={exportReportHtml} label="Copy HTML" />
+                  <DownloadBar reportHtml={exportReportHtml} allowedFormats={['DOCX', 'PDF']} />
                 </div>
               </div>
-              <ReportEditor html={art.reportHtml} onChange={() => {}} />
+              <ReportEditor html={art.reportHtml} onChange={setEditedReportHtml} />
             </div>
           )}
 
@@ -761,6 +902,7 @@ function Composer({ loading, mode, onModeChange, onSend }) {
           <option value="report">Report</option>
           <option value="presentation">Slides</option>
           <option value="export">Export</option>
+          <option value="map">Map</option>
         </select>
         <textarea
           ref={textareaRef}

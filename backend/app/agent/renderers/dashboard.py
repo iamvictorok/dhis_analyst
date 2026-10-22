@@ -46,29 +46,77 @@ def render_dashboard(state: AgentState) -> list[dict]:
         metric_name = row[3] if len(row) > 3 else metrics[0]["label"]
         metric_data.setdefault(metric_name, []).append(row)
 
+    period_order = _period_order(state)
+
     for metric_name, m_rows in metric_data.items():
-        x_values = [str(r[1]) for r in m_rows]  # Period
-        y_values = [_safe_float(r[2]) for r in m_rows]  # Value
-        orgs = [str(r[0]) for r in m_rows]  # Org unit
+        orgs_in_rows = list(dict.fromkeys(str(r[0]) for r in m_rows))
+        periods_in_rows = list(dict.fromkeys(str(r[1]) for r in m_rows))
+        periods_sorted = sorted(
+            periods_in_rows,
+            key=lambda p: (period_order.index(p) if p in period_order else len(period_order), p),
+        )
+        multi_org = len(orgs_in_rows) > 1
+        single_period = len(periods_sorted) == 1
+
+        # Build plotting series. DHIS2 returns rows in no guaranteed order and,
+        # for "by district" questions, one row per org unit per period. Plotting
+        # them as one flat series mislabels every bar (the old "National"
+        # bug), so: one org -> periods on x; many orgs + one period -> org
+        # units on x (ranked); many orgs + many periods -> one series per org.
+        if multi_org and single_period:
+            by_org = {str(r[0]): _safe_float(r[2]) for r in m_rows}
+            ranked = sorted(by_org.items(), key=lambda kv: kv[1], reverse=True)
+            x_axis_title = "Organisation unit"
+            plot_series = [{
+                "name": f"{metric_name} ({periods_sorted[0]})",
+                "x": [k for k, _ in ranked],
+                "y": [v for _, v in ranked],
+            }]
+            title = f"{metric_name} by organisation unit — {periods_sorted[0]}"
+        elif multi_org:
+            x_axis_title = "Period"
+            plot_series = []
+            for o in orgs_in_rows:
+                vals = {str(r[1]): _safe_float(r[2]) for r in m_rows if str(r[0]) == o}
+                plot_series.append({
+                    "name": o,
+                    "x": [p for p in periods_sorted if p in vals],
+                    "y": [vals[p] for p in periods_sorted if p in vals],
+                })
+            title = f"{metric_name} by organisation unit"
+        else:
+            vals = {str(r[1]): _safe_float(r[2]) for r in m_rows}
+            x_axis_title = "Period"
+            plot_series = [{
+                "name": metric_name,
+                "x": periods_sorted,
+                "y": [vals[p] for p in periods_sorted],
+            }]
+            title = f"{metric_name} — {orgs_in_rows[0] if orgs_in_rows else org}"
+
+        x_values = plot_series[0]["x"] if len(plot_series) == 1 else periods_sorted
+        y_values = plot_series[0]["y"] if len(plot_series) == 1 else []
+        table_rows = sorted(
+            m_rows,
+            key=lambda r: (str(r[0]), period_order.index(str(r[1])) if str(r[1]) in period_order else 0),
+        )
 
         # Deterministic chart ID based on content
-        chart_id = hashlib.sha256(f"{metric_name}:{':'.join(x_values)}".encode()).hexdigest()[:12]
+        chart_id = hashlib.sha256(
+            f"{metric_name}:{':'.join(orgs_in_rows)}:{':'.join(periods_sorted)}".encode()
+        ).hexdigest()[:12]
 
         for viz_type in viz_types:
             if viz_type in ("bar", "line"):
                 charts.append({
                     "id": f"{viz_type}-{chart_id}",
-                    "title": f"{metric_name} — {org}",
+                    "title": title,
                     "type": viz_type,
-                    "series": [{
-                        "name": metric_name,
-                        "x": x_values,
-                        "y": y_values,
-                    }],
-                    "axes": {"x": "Period", "y": "Value"},
-                    "layout": _dark_layout(f"{metric_name} — {org}", "Period", "Value"),
+                    "series": plot_series,
+                    "axes": {"x": x_axis_title, "y": "Value"},
+                    "layout": _dark_layout(title, x_axis_title, "Value"),
                 })
-            elif viz_type == "pie":
+            elif viz_type == "pie" and len(plot_series) == 1:
                 charts.append({
                     "id": f"pie-{chart_id}",
                     "title": f"{metric_name} Distribution",
@@ -84,23 +132,22 @@ def render_dashboard(state: AgentState) -> list[dict]:
                     "id": f"scatter-{chart_id}",
                     "title": f"{metric_name} Scatter",
                     "type": "scatter",
-                    "series": [{
-                        "name": metric_name,
-                        "x": x_values,
-                        "y": y_values,
-                        "mode": "markers",
-                    }],
-                    "axes": {"x": "Period", "y": "Value"},
-                    "layout": _dark_layout(f"{metric_name} Scatter", "Period", "Value"),
+                    "series": [dict(s, mode="markers") for s in plot_series],
+                    "axes": {"x": x_axis_title, "y": "Value"},
+                    "layout": _dark_layout(f"{metric_name} Scatter", x_axis_title, "Value"),
                 })
-            elif viz_type == "table":
+            elif viz_type == "table" or (viz_type == "pie" and len(plot_series) != 1):
                 charts.append({
                     "id": f"table-{chart_id}",
                     "title": f"{metric_name} Data Table",
                     "type": "table",
                     "series": [{
                         "header": ["Organisation Unit", "Period", "Value"],
-                        "cells": [orgs, x_values, [str(v) for v in y_values]],
+                        "cells": [
+                            [str(r[0]) for r in table_rows],
+                            [str(r[1]) for r in table_rows],
+                            [str(r[2]) for r in table_rows],
+                        ],
                     }],
                     "layout": _dark_layout(f"{metric_name} Data Table"),
                 })
@@ -135,6 +182,18 @@ def _dark_layout(title: str, xaxis: str = "", yaxis: str = "") -> dict:
             "zerolinecolor": "#334b5b",
         }
     return layout
+
+
+def _period_order(state: AgentState) -> list[str]:
+    """Chronological period display names, from DHIS2's metaData.dimensions.pe."""
+    meta = state.get("dhis2_data", {}).get("metadata", {}).get("raw_metadata", {}) or {}
+    pe_ids = (meta.get("dimensions") or {}).get("pe") or []
+    items = meta.get("items") or {}
+    order = []
+    for pid in pe_ids:
+        name = (items.get(pid) or {}).get("name")
+        order.append(str(name) if name else str(pid))
+    return order
 
 
 def _safe_float(val) -> float:

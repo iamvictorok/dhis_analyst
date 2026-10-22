@@ -9,6 +9,10 @@ from backend.app.agent.state import AgentState
 logger = logging.getLogger("dhis2_analyst.analytics")
 
 DHIS2_UID_RE = re.compile(r"^[A-Za-z][A-Za-z0-9]{10}$")
+# Data set reporting metrics, e.g. "BfMAe6Itzgt.REPORTING_RATE".
+REPORTING_RATE_RE = re.compile(
+    r"^[A-Za-z][A-Za-z0-9]{10}\.(REPORTING_RATE|REPORTING_RATE_ON_TIME|ACTUAL_REPORTS|ACTUAL_REPORTS_ON_TIME|EXPECTED_REPORTS)$"
+)
 
 
 def _join_dimension_items(items: list[str]) -> str:
@@ -32,9 +36,12 @@ def build_analytics_params(state: AgentState) -> dict[str, Any]:
     dx_items = []
     for m in state["metrics"]:
         uid = m.get("uid", "")
+        obj_type = m.get("object_type", "indicator")
+        if obj_type == "reportingRate" and REPORTING_RATE_RE.match(uid or ""):
+            dx_items.append(uid)
+            continue
         if not uid or uid == "UNRESOLVED" or not DHIS2_UID_RE.match(uid):
             continue
-        obj_type = m.get("object_type", "indicator")
         if obj_type not in _DX_VALID_TYPES:
             logger.warning(
                 "analytics_dx_type_mismatch",
@@ -51,34 +58,9 @@ def build_analytics_params(state: AgentState) -> dict[str, Any]:
         )
     dx = _join_dimension_items(dx_items)
     
-    ou_level = state["org_unit"]["level"]
-    ou_uid = state["org_unit"].get("uid", "")
-    ou_label = state["org_unit"].get("label", "")
+    ou = ou_dimension(state)
     all_disaggregations = state.get("disaggregations", [])
-    wants_children = "ou_children" in all_disaggregations
     disaggregations = [d for d in all_disaggregations if d != "ou_children"]
-    child_level = ou_level + 1 if wants_children else ou_level
-
-    ou_is_uid = bool(DHIS2_UID_RE.match(ou_uid))
-    is_national = ou_label.lower() in {"national", "federal"}
-
-    if ou_is_uid and wants_children:
-        ou = f"LEVEL-{child_level};{ou_uid}"
-    elif ou_is_uid:
-        ou = ou_uid
-    elif is_national:
-        # Honour a per-child breakdown for national scope too, instead of
-        # silently dropping it and returning a single aggregate row.
-        ou = f"USER_ORGUNIT;LEVEL-{child_level}" if wants_children else "USER_ORGUNIT"
-    else:
-        # A named org unit that never resolved to a real UID (e.g. "UNRESOLVED"
-        # or a leftover label) must NOT be sent as a dimension item — DHIS2
-        # rejects it with a 409. Fall back to the caller's own org scope.
-        logger.warning(
-            "analytics_org_unit_unresolved",
-            extra={"org_unit_label": ou_label, "org_unit_uid": ou_uid},
-        )
-        ou = f"USER_ORGUNIT;LEVEL-{child_level}" if wants_children else "USER_ORGUNIT"
 
     pe = _join_dimension_items(state["periods"])
 
@@ -88,6 +70,9 @@ def build_analytics_params(state: AgentState) -> dict[str, Any]:
         "outputIdScheme": "NAME",
         "skipMeta": "false",
     }
+    if state.get("include_numden"):
+        # Expert asked for numerator / denominator: DHIS2 returns them per row.
+        params["includeNumDen"] = "true"
     # Append valid category UIDs as dimensions. Free-text
     # tokens that failed to resolve in metadata_resolve are dropped to avoid 409s.
     category_uids = [d for d in disaggregations if DHIS2_UID_RE.match(d)]
@@ -101,6 +86,42 @@ def build_analytics_params(state: AgentState) -> dict[str, Any]:
         
     logger.info("build_analytics_params_complete", extra={"params": params})
     return params
+
+
+def ou_dimension(state: AgentState) -> str:
+    """The ``ou`` dimension for the request, honouring the breakdown level.
+
+    ``org_unit.breakdown_level`` (set by the resolver from "by district",
+    "each chiefdom", "facilities in Bo") wins; otherwise ``ou_children`` means
+    one level below the selected org unit.
+    """
+    org = state.get("org_unit") or {}
+    ou_level = int(org.get("level") or 1)
+    ou_uid = org.get("uid", "") or ""
+    ou_label = org.get("label", "") or ""
+    wants_children = "ou_children" in (state.get("disaggregations") or [])
+    breakdown = org.get("breakdown_level")
+    child_level = None
+    if isinstance(breakdown, int) and breakdown > ou_level:
+        child_level = breakdown
+    elif wants_children:
+        child_level = ou_level + 1
+
+    ou_is_uid = bool(DHIS2_UID_RE.match(ou_uid))
+    is_national = ou_label.lower() in {"national", "federal"}
+
+    if ou_is_uid and child_level:
+        return f"LEVEL-{child_level};{ou_uid}"
+    if ou_is_uid:
+        return ou_uid
+    if not is_national:
+        # A named org unit that never resolved to a real UID must NOT be sent as
+        # a dimension item (DHIS2 409). Fall back to the caller's own org scope.
+        logger.warning(
+            "analytics_org_unit_unresolved",
+            extra={"org_unit_label": ou_label, "org_unit_uid": ou_uid},
+        )
+    return f"USER_ORGUNIT;LEVEL-{child_level}" if child_level else "USER_ORGUNIT"
 
 
 # Canonical internal row layout shared with the mock data path and every
@@ -134,6 +155,9 @@ def normalise_analytics_response(raw: dict[str, Any], params: dict[str, Any]) ->
     def header_id(h: dict) -> str:
         return str(h.get("name") or h.get("column") or "").lower()
 
+    col_any: dict[str, int] = {}
+    for i, h in enumerate(raw_headers):
+        col_any.setdefault(header_id(h), i)
     col: dict[str, int] = {}
     for i, h in enumerate(raw_headers):
         hid = header_id(h)
@@ -148,8 +172,26 @@ def normalise_analytics_response(raw: dict[str, Any], params: dict[str, Any]) ->
         def cell(row: list, idx: int | None) -> Any:
             return row[idx] if idx is not None and idx < len(row) else ""
 
+        # Category / attribute dimensions (e.g. Gender, age group) requested as
+        # extra dimensions: keep them by folding the option name into the
+        # metric label, otherwise rows for Female and Male would collapse into
+        # indistinguishable duplicates.
+        extra_cols = [
+            i for i, h in enumerate(raw_headers)
+            if header_id(h) not in {"dx", "ou", "pe", "value", "co", "numerator",
+                                    "denominator", "factor", "multiplier", "divisor"}
+            and h.get("meta", True)
+        ]
+
+        def metric_cell(row: list) -> Any:
+            base = cell(row, mi)
+            extras = [str(cell(row, i)) for i in extra_cols if str(cell(row, i))]
+            if not extras:
+                return base
+            return f"{base} ({', '.join(extras)})" if base else ", ".join(extras)
+
         canonical_rows = [
-            [cell(r, oi), cell(r, pi), cell(r, vi), cell(r, mi)] for r in rows
+            [cell(r, oi), cell(r, pi), cell(r, vi), metric_cell(r)] for r in rows
         ]
         normalised = {
             "rows": canonical_rows,
@@ -160,6 +202,14 @@ def normalise_analytics_response(raw: dict[str, Any], params: dict[str, Any]) ->
                 "analytics_params": params,
             },
         }
+        ni, di = col_any.get("numerator"), col_any.get("denominator")
+        if ni is not None and di is not None:
+            normalised["metadata"]["numden"] = [
+                {"org": cell(r, oi), "period": cell(r, pi), "metric": metric_cell(r), "value": cell(r, vi),
+                 "numerator": cell(r, ni), "denominator": cell(r, di),
+                 "factor": cell(r, col_any.get("factor"))}
+                for r in rows
+            ]
         logger.info(
             "normalise_analytics_response_complete",
             extra={"rows_count": len(canonical_rows), "reordered": True},

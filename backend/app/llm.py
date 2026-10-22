@@ -6,6 +6,7 @@ credentials (LLM_API_KEY or LLM_BASE_URL).
 """
 from __future__ import annotations
 
+import asyncio
 import logging
 import time
 from typing import Any
@@ -13,6 +14,70 @@ from typing import Any
 from backend.config import Settings
 
 logger = logging.getLogger("dhis2_analyst.llm")
+
+# Per-request LLM call log (purpose, model, seconds, transient errors), exposed
+# to the client in the final "timings" SSE event so latency can be diagnosed
+# without server log access. No prompts, keys or content are recorded.
+import contextvars
+
+_CALL_LOG: contextvars.ContextVar[list | None] = contextvars.ContextVar("llm_call_log", default=None)
+
+
+def begin_call_log() -> list:
+    log: list = []
+    _CALL_LOG.set(log)
+    return log
+
+
+def _record_call(entry: dict) -> None:
+    log = _CALL_LOG.get()
+    if log is not None:
+        log.append(entry)
+
+_TRANSIENT_MARKERS = (
+    "503", "unavailable", "high demand", "overloaded", "429", "resource_exhausted",
+    "rate limit", "ratelimit", "timeout", "timed out", "500", "internal error",
+    "502", "504", "apiconnectionerror", "serviceunavailable",
+)
+
+
+_PRIMARY_DOWN_UNTIL: dict[str, float] = {}
+_BREAKER_SECONDS = 180.0
+_QUOTA_BREAKER_SECONDS = 900.0
+
+
+def _is_quota_exhausted(exc: Exception) -> bool:
+    text = f"{type(exc).__name__} {exc}".lower()
+    return ("429" in text or "ratelimit" in text or "resource_exhausted" in text or "quota" in text) and (
+        "per day" in text or "perday" in text or "quota" in text or "resource_exhausted" in text
+    )
+
+
+def _safe_error(exc: Exception) -> str:
+    """Short, key-free error summary for the client-side timings event."""
+    import re as _re
+    msg = f"{type(exc).__name__}: {exc}"
+    msg = _re.sub(r"(key=|api[_-]?key[\"':= ]+)[A-Za-z0-9_\-]{8,}", r"\1***", msg, flags=_re.I)
+    msg = _re.sub(r"AIza[0-9A-Za-z_\-]{20,}", "***", msg)
+    return msg[:220]
+
+
+def _is_transient(exc: Exception) -> bool:
+    text = f"{type(exc).__name__} {exc}".lower()
+    return any(m in text for m in _TRANSIENT_MARKERS)
+
+
+def _fallback_models(settings: Settings, primary: str) -> list[str]:
+    raw = (settings.llm_fallback_models or "").strip()
+    if raw.lower() == "none":
+        return []
+    if raw:
+        models = [m.strip() for m in raw.split(",") if m.strip()]
+    elif "gemini" in settings.llm_provider.lower() or "gemini" in primary.lower():
+        models = ["gemini/gemini-flash-lite-latest"]
+    else:
+        models = []
+    return [m for m in models if m != primary]
 
 
 async def complete(
@@ -40,6 +105,10 @@ async def complete(
         return _mock_completion(messages, json_mode=json_mode)
 
     try:
+        import os as _os
+        # Use the bundled model cost map instead of fetching it from GitHub on
+        # first import (slow on a cold free-tier instance).
+        _os.environ.setdefault("LITELLM_LOCAL_MODEL_COST_MAP", "True")
         import litellm
 
         # Let LiteLLM drop provider-unsupported params (e.g. response_format on
@@ -54,7 +123,7 @@ async def complete(
             "model": model,
             "messages": messages,
             "timeout": settings.llm_timeout_seconds,
-            "num_retries": 1,
+            "num_retries": 0,  # retries/fallbacks handled below
         }
 
         if "gemini" not in settings.llm_provider.lower() and "gemini" not in model.lower():
@@ -78,17 +147,69 @@ async def complete(
         )
 
         start = time.monotonic()
-        response = await litellm.acompletion(**kwargs)
-        content = response.choices[0].message.content or ""
-        logger.info(
-            "llm_call_ok",
-            extra={
-                "provider": settings.llm_provider,
-                "chars": len(content),
-                "duration_ms": int((time.monotonic() - start) * 1000),
-            },
-        )
-        return content
+        fallbacks = _fallback_models(settings, model)
+        candidates = [model] + fallbacks
+        retries = max(0, int(settings.llm_transient_retries))
+        # Circuit breaker: right after the primary model exhausted its retries
+        # on transient errors (e.g. Gemini 503 "high demand"), go straight to
+        # the fallback for a few minutes, keeping the primary as the last resort
+        # with a single attempt. Saves ~10-20 s of doomed retries per call.
+        breaker_open = bool(fallbacks) and _PRIMARY_DOWN_UNTIL.get(model, 0.0) > time.monotonic()
+        if breaker_open:
+            candidates = fallbacks + [model]
+        last_exc: Exception | None = None
+        live = [c for c in candidates if _PRIMARY_DOWN_UNTIL.get(c, 0.0) <= time.monotonic()]
+        if live and len(live) < len(candidates):
+            # Models marked down go last, with a single attempt.
+            candidates = live + [c for c in candidates if c not in live]
+        for idx, candidate in enumerate(candidates):
+            # Primary gets the full retry budget; each fallback gets one retry.
+            is_primary = candidate == model
+            attempts = 1 + (retries if (is_primary and not breaker_open) else min(retries, 1))
+            if breaker_open and is_primary:
+                attempts = 1
+            for attempt in range(attempts):
+                try:
+                    response = await litellm.acompletion(**{**kwargs, "model": candidate})
+                except Exception as exc:  # noqa: BLE001 - classified below
+                    last_exc = exc
+                    if not _is_transient(exc):
+                        raise
+                    logger.warning(
+                        "llm_call_transient",
+                        extra={"model": candidate, "attempt": attempt + 1, "error": str(exc)[:300]},
+                    )
+                    _record_call({"model": candidate, "attempt": attempt + 1, "transient": True,
+                                  "error": _safe_error(exc), "seconds": round(time.monotonic() - start, 2)})
+                    if _is_quota_exhausted(exc):
+                        # Daily / quota exhaustion: retrying the same model only burns
+                        # more quota and time. Mark it down and move to the next model.
+                        _PRIMARY_DOWN_UNTIL[candidate] = time.monotonic() + _QUOTA_BREAKER_SECONDS
+                        break
+                    if attempt + 1 < attempts:
+                        await asyncio.sleep(settings.llm_retry_backoff_seconds * (2 ** attempt))
+                    elif is_primary and fallbacks:
+                        _PRIMARY_DOWN_UNTIL[model] = time.monotonic() + _BREAKER_SECONDS
+                    continue
+                content = response.choices[0].message.content or ""
+                _PRIMARY_DOWN_UNTIL.pop(candidate, None)
+                _record_call({"model": candidate, "fallback": not is_primary, "breaker": breaker_open, "attempt": attempt + 1,
+                              "seconds": round(time.monotonic() - start, 2), "json": json_mode})
+                logger.info(
+                    "llm_call_ok",
+                    extra={
+                        "provider": settings.llm_provider,
+                        "model": candidate,
+                        "fallback": idx > 0,
+                        "chars": len(content),
+                        "duration_ms": int((time.monotonic() - start) * 1000),
+                    },
+                )
+                return content
+        assert last_exc is not None
+        _record_call({"model": model, "failed": True, "seconds": round(time.monotonic() - start, 2),
+                      "error": type(last_exc).__name__})
+        raise last_exc
 
     except Exception as exc:
         logger.error(

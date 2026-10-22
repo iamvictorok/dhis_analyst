@@ -27,6 +27,17 @@ class Settings(SettingsBase):
     dhis2_base_url: str = "https://play.dhis2.org/dev"
     dhis2_service_account_user: str = ""
     dhis2_service_account_pass: str = ""
+    # Failover: comma-separated instances tried in order (first = primary).
+    # Empty -> just DHIS2_BASE_URL. The first that passes its health check
+    # serves requests; the header dot shows live (primary) or fallback.
+    dhis2_base_urls: str = ""
+    # auto: serve the committed demo snapshot when every instance is down.
+    # off: never use the snapshot. always: snapshot only (offline rehearsal).
+    dhis2_snapshot_mode: Literal["auto", "off", "always"] = "auto"
+    dhis2_snapshot_path: str = ""          # default: backend/demo_snapshot/dhis2_snapshot.json
+    dhis2_snapshot_record_path: str = ""   # set only when recording a new snapshot
+    dhis2_health_interval_seconds: int = 60
+    dhis2_health_timeout_seconds: float = 8.0
 
     # mock | openai | anthropic | ollama | azure | cohere | gemini.
     # Defaults to "mock" so the app boots without external credentials (and so
@@ -37,6 +48,13 @@ class Settings(SettingsBase):
     llm_api_key: str = ""
     llm_base_url: str = ""              # for Ollama: http://localhost:11434
     llm_timeout_seconds: int = 30
+    # Transient-error resilience (503 "high demand", 429, timeouts): retry the
+    # primary model with backoff, then try each fallback model in order.
+    # Comma-separated LiteLLM model strings; empty = provider default (gemini:
+    # gemini/gemini-flash-lite-latest). Set to "none" to disable fallbacks.
+    llm_fallback_models: str = ""
+    llm_transient_retries: int = 2
+    llm_retry_backoff_seconds: float = 2.0
 
     # Embedding model
     embedding_provider: str = "mock"    # mock | openai | cohere | ollama
@@ -57,6 +75,13 @@ class Settings(SettingsBase):
     redis_url: str = ""
     jwt_secret: str = "change-me-in-production"
     jwt_expire_seconds: int = 3600
+    # Standalone mode: if set, /auth/login only accepts this password (any
+    # username). Leave empty for local use; SET IT for any hosted demo, or
+    # anyone with the URL can log in and spend the LLM quota.
+    standalone_access_code: str = ""
+    # Refuse to start in standalone mode without STANDALONE_ACCESS_CODE.
+    # Defaults to on automatically when running on Render (RENDER=true).
+    require_access_code: bool = False
 
     # File storage
     temp_file_dir: str = "/tmp/dhis2_analyst"
@@ -103,6 +128,10 @@ class Settings(SettingsBase):
 
 
 
+    @property
+    def is_hosted(self) -> bool:
+        return self.require_access_code or os.environ.get("RENDER", "").lower() == "true"
+
     def startup_checks(self) -> None:
         """Hard-fail on insecure or incomplete configuration.
 
@@ -111,6 +140,18 @@ class Settings(SettingsBase):
         a production JWT secret, which is what makes the shipped ``.env.example``
         runnable out of the box.
         """
+        if (
+            self.is_hosted
+            and self.deployment_mode in {"standalone", "combined"}
+            and not self.standalone_access_code.strip()
+        ):
+            logger.critical(
+                "FATAL: hosted deployment without STANDALONE_ACCESS_CODE — anyone "
+                "with the URL could log in and spend the LLM quota. Set "
+                "STANDALONE_ACCESS_CODE (or unset REQUIRE_ACCESS_CODE for local use)."
+            )
+            sys.exit(1)
+
         if self.llm_provider == "mock":
             logger.warning(
                 "llm_provider=mock — running with the deterministic local "

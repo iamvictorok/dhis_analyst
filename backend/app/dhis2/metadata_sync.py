@@ -125,6 +125,8 @@ async def sync_metadata(settings: Settings) -> dict[str, Any]:
     if totals["synced"] > 0:
         from backend.app.db.metadata_index import invalidate_indicator_catalogue_cache
         invalidate_indicator_catalogue_cache()
+        from backend.app.agent.resolution import invalidate_catalogue
+        invalidate_catalogue()
 
     return {
         "status": status,

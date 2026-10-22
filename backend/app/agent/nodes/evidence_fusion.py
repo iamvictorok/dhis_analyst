@@ -49,23 +49,40 @@ async def fuse_evidence(state: AgentState, settings: Settings) -> AgentState:
         })
 
     # --- Trend evidence (computed from data) ---
+    # Only meaningful for one metric in one org unit over several periods.
+    # DHIS2 rows arrive in no guaranteed order, so sort by the chronological
+    # period list in metaData before comparing first vs last, and name the
+    # actual periods (not the relative code, e.g. "LAST_12_MONTHS").
     rows = data.get("rows", [])
-    if len(rows) >= 2:
+    if len(rows) >= 2 and state.get("metrics"):
         try:
-            values = [float(r[2]) for r in rows if len(r) > 2]
-            if len(values) >= 2 and values[0] > 0:
-                change = ((values[-1] - values[0]) / values[0]) * 100
-                direction = "increased" if change > 0 else "decreased"
-                items.append({
-                    "claim": (
-                        f"{state['metrics'][0]['label']} {direction} by "
-                        f"{abs(change):.1f}% between {state['periods'][0]} and "
-                        f"{state['periods'][-1]} in {state['org_unit']['label']}."
-                    ),
-                    "source": "dhis2",
-                    "source_detail": "Computed from retrieved data rows",
-                    "confidence": 0.95 if len(values) > 2 else 0.80,
-                })
+            orgs = {str(r[0]) for r in rows}
+            metric_names = {str(r[3]) for r in rows if len(r) > 3}
+            if len(orgs) == 1 and len(metric_names) <= 1:
+                meta = data.get("metadata", {}).get("raw_metadata", {}) or {}
+                items_meta = meta.get("items") or {}
+                order = [
+                    str((items_meta.get(pid) or {}).get("name") or pid)
+                    for pid in ((meta.get("dimensions") or {}).get("pe") or [])
+                ]
+                series = sorted(
+                    ((str(r[1]), float(r[2])) for r in rows if len(r) > 2),
+                    key=lambda pv: order.index(pv[0]) if pv[0] in order else len(order),
+                )
+                if len(series) >= 2 and series[0][1] > 0:
+                    (p0, v0), (p1, v1) = series[0], series[-1]
+                    change = ((v1 - v0) / v0) * 100
+                    direction = "increased" if change > 0 else "decreased"
+                    items.append({
+                        "claim": (
+                            f"{state['metrics'][0]['label']} {direction} by "
+                            f"{abs(change):.1f}% from {p0} ({v0:g}) to {p1} ({v1:g}) "
+                            f"in {next(iter(orgs))}."
+                        ),
+                        "source": "dhis2",
+                        "source_detail": "Computed from retrieved data rows",
+                        "confidence": 0.95 if len(series) > 2 else 0.80,
+                    })
         except (ValueError, TypeError, IndexError):
             pass
 
